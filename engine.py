@@ -11,10 +11,34 @@ class SatellitesGame:
         # Board Setup
         # Rows 0-8. Widths: 8, 9, 10, 11, 12, 11, 10, 9, 8
         self.row_widths = [8, 9, 10, 11, 12, 11, 10, 9, 8]
+        (
+            self.cell_id_to_coord,
+            self.coord_to_cell_id,
+            self.neighbors_by_cell_id,
+        ) = self._build_topology()
+        self.num_cells = len(self.cell_id_to_coord)
+        self.distance_by_cell_id = self._build_distance_matrix()
+        self._grid = {}
         self.grid = {} # Key: (row, col), Value: {'owner': 0/1, 'type': 'tank'/'bot', 'count': int}
+        self._cache_dirty = True
+        self.unit_owner = [-1] * self.num_cells
+        self.unit_kind = [0] * self.num_cells  # 0 empty, 1 bot, 2 tank
+        self.unit_count = [0] * self.num_cells
+        self.owner_total_units = [0, 0]
+        self.owner_bot_cells = [set(), set()]
+        self.owner_tank_cells = [set(), set()]
+        self.is_artefact_cell = [False] * self.num_cells
+        self.is_p0_start_cell = [False] * self.num_cells
+        self.is_p1_start_cell = [False] * self.num_cells
         
         # Artefacts
         self.artefacts = [(2,1), (2,8), (4,4), (4,7), (6,1), (6,8)]
+        for coord in self.artefacts:
+            self.is_artefact_cell[self.coord_to_cell_id[coord]] = True
+        for coord in ((0,3), (0,4)):
+            self.is_p0_start_cell[self.coord_to_cell_id[coord]] = True
+        for coord in ((8,3), (8,4)):
+            self.is_p1_start_cell[self.coord_to_cell_id[coord]] = True
         
         # Players: 0 (Red), 1 (Blue)
         # Starting units
@@ -23,6 +47,7 @@ class SatellitesGame:
         
         self.add_unit(8, 3, 1, 'bot', 2)
         self.add_unit(8, 4, 1, 'tank', 2)
+        self._ensure_cache()
 
         # Satellites
         self.satellites = [
@@ -62,53 +87,397 @@ class SatellitesGame:
         self.turn_count = 1
         self.MAX_TURNS = 100
 
+    @property
+    def grid(self):
+        return self._grid
+
+    @grid.setter
+    def grid(self, value):
+        self._grid = value
+        self._cache_dirty = True
+
+    def _ensure_cache(self):
+        if not self._cache_dirty:
+            return
+        self.unit_owner = [-1] * self.num_cells
+        self.unit_kind = [0] * self.num_cells
+        self.unit_count = [0] * self.num_cells
+        self.owner_total_units = [0, 0]
+        self.owner_bot_cells = [set(), set()]
+        self.owner_tank_cells = [set(), set()]
+        for (r, c), u in self.grid.items():
+            cid = self.coord_to_cell_id[(r, c)]
+            owner = u['owner']
+            kind = 2 if u['type'] == 'tank' else 1
+            count = u['count']
+            self.unit_owner[cid] = owner
+            self.unit_kind[cid] = kind
+            self.unit_count[cid] = count
+            self.owner_total_units[owner] += count
+            if kind == 2:
+                self.owner_tank_cells[owner].add(cid)
+            else:
+                self.owner_bot_cells[owner].add(cid)
+        self._cache_dirty = False
+
     def add_unit(self, r, c, owner, u_type, count):
         if (r, c) not in self.grid:
             self.grid[(r, c)] = {'owner': owner, 'type': u_type, 'count': 0}
         self.grid[(r, c)]['count'] += count
+        self._cache_dirty = True
+
+    def clone(self):
+        """Fast, engine-aware clone used by search code."""
+        new = self.__class__.__new__(self.__class__)
+
+        # Immutable/static topology can be shared.
+        new.headless = self.headless
+        new.row_widths = self.row_widths
+        new.cell_id_to_coord = self.cell_id_to_coord
+        new.coord_to_cell_id = self.coord_to_cell_id
+        new.neighbors_by_cell_id = self.neighbors_by_cell_id
+        new.num_cells = self.num_cells
+        new.distance_by_cell_id = self.distance_by_cell_id
+
+        # Mutable game state.
+        new._grid = {k: v.copy() for k, v in self._grid.items()}
+        new._cache_dirty = self._cache_dirty
+        new.unit_owner = self.unit_owner.copy()
+        new.unit_kind = self.unit_kind.copy()
+        new.unit_count = self.unit_count.copy()
+        new.owner_total_units = self.owner_total_units.copy()
+        new.owner_bot_cells = [self.owner_bot_cells[0].copy(), self.owner_bot_cells[1].copy()]
+        new.owner_tank_cells = [self.owner_tank_cells[0].copy(), self.owner_tank_cells[1].copy()]
+        new.is_artefact_cell = self.is_artefact_cell.copy()
+        new.is_p0_start_cell = self.is_p0_start_cell.copy()
+        new.is_p1_start_cell = self.is_p1_start_cell.copy()
+
+        new.artefacts = self.artefacts.copy()
+        new.satellites = [sat.copy() for sat in self.satellites]
+        new.scores = self.scores.copy()
+        new.turn = self.turn
+        new.state = self.state
+        new.active_satellite_idx = self.active_satellite_idx
+        new.actions_remaining = self.actions_remaining
+        new.picked_up_charges = self.picked_up_charges
+        new.action_type = self.action_type
+        new.selected_hex = self.selected_hex
+        new.pending_move_dest = self.pending_move_dest
+        new.pending_move_max = self.pending_move_max
+        new.move_amount_selection = self.move_amount_selection
+        new.info_message = self.info_message
+        new.winner = self.winner
+        new.turn_count = self.turn_count
+        new.MAX_TURNS = self.MAX_TURNS
+        if hasattr(self, 'distribution_direction'):
+            new.distribution_direction = self.distribution_direction
+        return new
+
+    def _capture_undo_token_for_action(self, action):
+        kind = action[0]
+        changed_cells = {}
+        if kind == 'add':
+            coords = [(action[1], action[2])]
+        elif kind == 'move':
+            coords = [action[1], action[2]]
+        else:
+            coords = []
+
+        for coord in coords:
+            if coord in changed_cells:
+                continue
+            cell = self._grid.get(coord)
+            changed_cells[coord] = None if cell is None else cell.copy()
+
+        return {
+            "_grid_cells": changed_cells,
+            "artefacts": self.artefacts.copy(),
+            "is_artefact_cell": self.is_artefact_cell.copy(),
+            "satellites": [sat.copy() for sat in self.satellites],
+            "scores": self.scores.copy(),
+            "turn": self.turn,
+            "state": self.state,
+            "active_satellite_idx": self.active_satellite_idx,
+            "actions_remaining": self.actions_remaining,
+            "picked_up_charges": self.picked_up_charges,
+            "action_type": self.action_type,
+            "selected_hex": self.selected_hex,
+            "pending_move_dest": self.pending_move_dest,
+            "pending_move_max": self.pending_move_max,
+            "move_amount_selection": self.move_amount_selection,
+            "info_message": self.info_message,
+            "winner": self.winner,
+            "turn_count": self.turn_count,
+            "MAX_TURNS": self.MAX_TURNS,
+            "distribution_direction": getattr(self, "distribution_direction", None),
+        }
+
+    def undo_action(self, token):
+        for coord, cell in token["_grid_cells"].items():
+            if cell is None:
+                self._grid.pop(coord, None)
+            else:
+                self._grid[coord] = cell
+        self.artefacts = token["artefacts"]
+        self.is_artefact_cell = token["is_artefact_cell"]
+        self.satellites = token["satellites"]
+        self._cache_dirty = True
+        self.scores = token["scores"]
+        self.turn = token["turn"]
+        self.state = token["state"]
+        self.active_satellite_idx = token["active_satellite_idx"]
+        self.actions_remaining = token["actions_remaining"]
+        self.picked_up_charges = token["picked_up_charges"]
+        self.action_type = token["action_type"]
+        self.selected_hex = token["selected_hex"]
+        self.pending_move_dest = token["pending_move_dest"]
+        self.pending_move_max = token["pending_move_max"]
+        self.move_amount_selection = token["move_amount_selection"]
+        self.info_message = token["info_message"]
+        self.winner = token["winner"]
+        self.turn_count = token["turn_count"]
+        self.MAX_TURNS = token["MAX_TURNS"]
+        if token["distribution_direction"] is not None:
+            self.distribution_direction = token["distribution_direction"]
+        elif hasattr(self, "distribution_direction"):
+            delattr(self, "distribution_direction")
+
+    def apply_action_with_undo(self, action):
+        """Apply an action and return (success, token, aux).
+
+        Supported action formats:
+        - ('select_satellite', idx)
+        - ('set_direction', clockwise_bool)
+        - ('add', r, c)
+        - ('move', (r0, c0), (r1, c1), amount)
+        """
+        kind = action[0]
+        if kind == 'select_satellite':
+            token = self._capture_undo_token_for_action(action)
+            old_state = self.state
+            old_active = self.active_satellite_idx
+            self.select_satellite(action[1])
+            success = (self.state != old_state) or (self.active_satellite_idx != old_active)
+            return success, token, None
+        if kind == 'set_direction':
+            token = self._capture_undo_token_for_action(action)
+            old_state = self.state
+            self.set_distribution_direction(action[1])
+            success = self.state != old_state or old_state == "CHOOSE_DIRECTION"
+            return success, token, None
+        if kind == 'add':
+            token = self._capture_undo_token_for_action(action)
+            success = self.execute_add(action[1], action[2])
+            return success, token, None
+        if kind == 'move':
+            token = self._capture_undo_token_for_action(action)
+            success, kills, score_gain = self.execute_move(action[1], action[2], action[3])
+            return success, token, (kills, score_gain)
+        raise ValueError(f"Unsupported action kind: {kind}")
+
+    def apply_action(self, action):
+        """Apply an action without keeping undo token."""
+        kind = action[0]
+        if kind == 'select_satellite':
+            old_state = self.state
+            old_active = self.active_satellite_idx
+            self.select_satellite(action[1])
+            return (self.state != old_state) or (self.active_satellite_idx != old_active)
+        if kind == 'set_direction':
+            old_state = self.state
+            self.set_distribution_direction(action[1])
+            return self.state != old_state or old_state == "CHOOSE_DIRECTION"
+        if kind == 'add':
+            return self.execute_add(action[1], action[2])
+        if kind == 'move':
+            success, _, _ = self.execute_move(action[1], action[2], action[3])
+            return success
+        raise ValueError(f"Unsupported action kind: {kind}")
+
+    def _is_legal_add(self, r, c):
+        if self.state != "PERFORM_ACTIONS" or "add" not in (self.action_type or ""):
+            return False
+        if self.get_player_unit_count(self.turn) >= 20:
+            return False
+
+        unit_type = 'tank' if 'tank' in self.action_type else 'bot'
+        current = self.grid.get((r, c))
+
+        if unit_type == 'tank':
+            is_own_tank_stack = (
+                current is not None and
+                current['owner'] == self.turn and
+                current['type'] == 'tank'
+            )
+            if current is not None and not is_own_tank_stack:
+                return False
+            opp_starts = [(8,3), (8,4)] if self.turn == 0 else [(0,3), (0,4)]
+            if (r, c) in opp_starts:
+                return False
+            if (r, c) in self.artefacts:
+                return False
+            return True
+
+        is_own_stack = (current and current['owner'] == self.turn and current['type'] == unit_type)
+        valid_starts = [(0,3), (0,4)] if self.turn == 0 else [(8,3), (8,4)]
+        is_start_zone = ((r, c) in valid_starts) and (not current or is_own_stack)
+        return bool(is_own_stack or is_start_zone)
+
+    def _is_legal_move(self, start, end, amount):
+        if self.state != "PERFORM_ACTIONS" or "move" not in (self.action_type or ""):
+            return False
+        if start not in self.grid:
+            return False
+        cell = self.grid[start]
+        if cell['owner'] != self.turn:
+            return False
+        if amount < 1 or amount > cell['count']:
+            return False
+
+        req_type = 'tank' if 'tank' in self.action_type else 'bot'
+        if cell['type'] != req_type:
+            return False
+
+        if end not in self.get_hex_neighbors(start[0], start[1]):
+            return False
+
+        opp_starts = [(8,3), (8,4)] if self.turn == 0 else [(0,3), (0,4)]
+        if end in opp_starts:
+            return False
+
+        move_type = cell['type']
+        if move_type == 'tank' and end in self.artefacts:
+            return False
+
+        target = self.grid.get(end)
+        if not target:
+            return True
+        if target['owner'] == self.turn:
+            return target['type'] == move_type
+        if move_type == 'bot':
+            return False
+        if move_type == 'tank' and target['type'] == 'tank' and target['count'] >= amount:
+            return False
+        return True
+
+    def legal_actions(self):
+        if self.state == "GAME_OVER":
+            return []
+
+        if self.state == "CHOOSE_SATELLITE":
+            actions = []
+            for i, sat in enumerate(self.satellites):
+                if sat['charges'] > 0:
+                    actions.append(('select_satellite', i))
+            return actions
+
+        if self.state == "CHOOSE_DIRECTION":
+            return [('set_direction', False), ('set_direction', True)]
+
+        if self.state != "PERFORM_ACTIONS":
+            return []
+
+        actions = []
+        if "add" in (self.action_type or ""):
+            for r in range(9):
+                for c in range(self.row_widths[r]):
+                    if self._is_legal_add(r, c):
+                        actions.append(('add', r, c))
+            return actions
+
+        if "move" in (self.action_type or ""):
+            req_type = 'tank' if 'tank' in self.action_type else 'bot'
+            for (r, c), unit in sorted(self.grid.items(), key=lambda kv: kv[0]):
+                if unit['owner'] != self.turn or unit['type'] != req_type:
+                    continue
+                for nr, nc in self.get_hex_neighbors(r, c):
+                    for amount in range(1, unit['count'] + 1):
+                        if self._is_legal_move((r, c), (nr, nc), amount):
+                            actions.append(('move', (r, c), (nr, nc), amount))
+            return actions
+
+        return actions
 
     def get_player_unit_count(self, owner):
-        total = 0
-        for u in self.grid.values():
-            if u['owner'] == owner:
-                total += u['count']
-        return total
+        self._ensure_cache()
+        return self.owner_total_units[owner]
+
+    def _build_topology(self):
+        cell_id_to_coord = []
+        coord_to_cell_id = {}
+        for r in range(9):
+            for c in range(self.row_widths[r]):
+                cid = len(cell_id_to_coord)
+                coord = (r, c)
+                cell_id_to_coord.append(coord)
+                coord_to_cell_id[coord] = cid
+
+        neighbors_by_cell_id = []
+        for r, c in cell_id_to_coord:
+            directions = [
+                (r, c - 1),
+                (r, c + 1),
+            ]
+            if r > 0:
+                if r <= 4:
+                    directions.append((r - 1, c - 1))
+                    directions.append((r - 1, c))
+                else:
+                    directions.append((r - 1, c))
+                    directions.append((r - 1, c + 1))
+            if r < 8:
+                if r < 4:
+                    directions.append((r + 1, c))
+                    directions.append((r + 1, c + 1))
+                else:
+                    directions.append((r + 1, c - 1))
+                    directions.append((r + 1, c))
+
+            valid = []
+            for nr, nc in directions:
+                if 0 <= nr < 9 and 0 <= nc < self.row_widths[nr]:
+                    valid.append((nr, nc))
+            neighbors_by_cell_id.append(tuple(valid))
+
+        return tuple(cell_id_to_coord), coord_to_cell_id, tuple(neighbors_by_cell_id)
+
+    def _build_distance_matrix(self):
+        distance = [[-1] * self.num_cells for _ in range(self.num_cells)]
+        for src in range(self.num_cells):
+            queue = [src]
+            distance[src][src] = 0
+            head = 0
+            while head < len(queue):
+                cur = queue[head]
+                head += 1
+                base_d = distance[src][cur]
+                for nr, nc in self.neighbors_by_cell_id[cur]:
+                    nxt = self.coord_to_cell_id[(nr, nc)]
+                    if distance[src][nxt] != -1:
+                        continue
+                    distance[src][nxt] = base_d + 1
+                    queue.append(nxt)
+        return tuple(tuple(row) for row in distance)
 
     def get_hex_neighbors(self, r, c):
-        directions = []
-        # Same row
-        directions.append((r, c-1))
-        directions.append((r, c+1))
-        
-        # Row Above (r-1)
-        if r > 0:
-            if r <= 4: # Row above is narrower (or equal for 4->3)
-                directions.append((r-1, c-1)) # Top Left
-                directions.append((r-1, c))   # Top Right
-            else: # Row above is wider
-                directions.append((r-1, c))   # Top Left
-                directions.append((r-1, c+1)) # Top Right
+        cell_id = self.coord_to_cell_id.get((r, c))
+        if cell_id is None:
+            return []
+        return list(self.neighbors_by_cell_id[cell_id])
 
-        # Row Below (r+1)
-        if r < 8:
-            if r < 4: # Row below is wider
-                directions.append((r+1, c))   # Bot Left
-                directions.append((r+1, c+1)) # Bot Right
-            else: # Row below is narrower
-                directions.append((r+1, c-1)) # Bot Left
-                directions.append((r+1, c))   # Bot Right
-
-        valid = []
-        for nr, nc in directions:
-            if 0 <= nr < 9 and 0 <= nc < self.row_widths[nr]:
-                valid.append((nr, nc))
-        return valid
+    def get_hex_distance(self, a, b):
+        a_id = self.coord_to_cell_id.get(a)
+        b_id = self.coord_to_cell_id.get(b)
+        if a_id is None or b_id is None:
+            return -1
+        return self.distance_by_cell_id[a_id][b_id]
 
     def check_actions_still_possible(self):
         """Checks if any valid moves remain for the current action type. If not, auto-end turn."""
         if not self.action_type:
             self.end_turn()
             return
+        self._ensure_cache()
 
         req_type = 'tank' if 'tank' in self.action_type else 'bot'
         
@@ -123,30 +492,21 @@ class SatellitesGame:
                 # Check Placement Locations
                 if req_type == 'tank':
                     # Tanks can drop on own tank stacks, or empty non-opponent-start hexes.
-                    opp_starts = [(8,3), (8,4)] if self.turn == 0 else [(0,3), (0,4)]
+                    opp_start_mask = self.is_p1_start_cell if self.turn == 0 else self.is_p0_start_cell
 
                     # Scan grid for any valid empty spot
-                    for r in range(9):
-                        for c in range(self.row_widths[r]):
-                            # Must be empty and not opponent start
-                            if (r,c) not in self.grid and (r,c) not in opp_starts:
-                                can_act = True
-                                break
-                        if can_act:
+                    for cid in range(self.num_cells):
+                        if self.unit_owner[cid] == -1 and not opp_start_mask[cid] and not self.is_artefact_cell[cid]:
+                            can_act = True
                             break
                     # Or any existing own tank stack
                     if not can_act:
-                        for u in self.grid.values():
-                            if u['owner'] == self.turn and u['type'] == 'tank':
-                                can_act = True
-                                break
+                        can_act = len(self.owner_tank_cells[self.turn]) > 0
                 else:
                     # OLD RULE (Bots): Start Zones or Own Stacks
                     # 1. Existing Own Stacks?
-                    for u in self.grid.values():
-                        if u['owner'] == self.turn and u['type'] == req_type:
-                            can_act = True
-                            break
+                    if req_type == 'bot':
+                        can_act = len(self.owner_bot_cells[self.turn]) > 0
                     # 2. Empty Start Zones?
                     if not can_act:
                         starts = [(0,3), (0,4)] if self.turn == 0 else [(8,3), (8,4)]
@@ -228,12 +588,18 @@ class SatellitesGame:
             if (r,c) in opp_starts:
                 self.info_message = "Cannot place in opponent start zone."
                 return False
+
+            # 3. Must not be an artefact hex
+            if (r,c) in self.artefacts:
+                self.info_message = "Cannot place tank on an artefact."
+                return False
                 
             # === EXECUTION (Single Unit) ===
             if is_own_tank_stack:
                 current['count'] += 1
             else:
                 self.grid[(r,c)] = {'owner': self.turn, 'type': 'tank', 'count': 1}
+            self._cache_dirty = True
             self.actions_remaining -= 1
             self.info_message = f"Added tank. Actions: {self.actions_remaining}"
             
@@ -259,10 +625,12 @@ class SatellitesGame:
             # --- EXECUTION ---
             if current:
                 current['count'] += 1
+                self._cache_dirty = True
                 self.actions_remaining -= 1
                 self.info_message = f"Added {unit_type}. Actions: {self.actions_remaining}"
             else:
                 self.grid[(r,c)] = {'owner': self.turn, 'type': unit_type, 'count': 1}
+                self._cache_dirty = True
                 self.actions_remaining -= 1
                 self.info_message = f"Added {unit_type}. Actions: {self.actions_remaining}"
                 
@@ -366,6 +734,7 @@ class SatellitesGame:
 
         # --- EXECUTION ---
         cell['count'] -= amount
+        self._cache_dirty = True
         if cell['count'] < 0: return False, 0, 0
         
         if cell['count'] == 0:
@@ -421,6 +790,7 @@ class SatellitesGame:
         # --- ARTEFACT LOGIC ---
         if did_move_in and end in self.artefacts:
             self.artefacts.remove(end)
+            self.is_artefact_cell[self.coord_to_cell_id[end]] = False
             # Rule: 1 point per bot in the stack
             score_gain = amount  
             self.scores[self.turn] += score_gain 
@@ -476,13 +846,13 @@ class SatellitesGame:
         action_main = 'move' if 'move' in self.satellites[self.active_satellite_idx]['type'] else 'add'
         
         can_act = True
+        self._ensure_cache()
         if action_main == 'move':
             # Check if user has ANY units of this type
-            has_units = False
-            for u in self.grid.values():
-                if u['owner'] == self.turn and u['type'] == req_type:
-                    has_units = True
-                    break
+            if req_type == 'tank':
+                has_units = len(self.owner_tank_cells[self.turn]) > 0
+            else:
+                has_units = len(self.owner_bot_cells[self.turn]) > 0
             if not has_units:
                 can_act = False
                 self.info_message = f"No {req_type}s to move! Turn Ending."
@@ -497,26 +867,18 @@ class SatellitesGame:
             else:
                 if req_type == 'tank':
                     # Tanks can drop on own tank stacks, or empty non-opponent-start hexes.
-                    opp_starts = [(8,3), (8,4)] if self.turn == 0 else [(0,3), (0,4)]
-                    for r in range(9):
-                        for c in range(self.row_widths[r]):
-                            if (r,c) not in self.grid and (r,c) not in opp_starts:
-                                can_add = True
-                                break
-                        if can_add:
+                    opp_start_mask = self.is_p1_start_cell if self.turn == 0 else self.is_p0_start_cell
+                    for cid in range(self.num_cells):
+                        if self.unit_owner[cid] == -1 and not opp_start_mask[cid] and not self.is_artefact_cell[cid]:
+                            can_add = True
                             break
                     if not can_add:
-                        for u in self.grid.values():
-                            if u['owner'] == self.turn and u['type'] == 'tank':
-                                can_add = True
-                                break
+                        can_add = len(self.owner_tank_cells[self.turn]) > 0
                 else:
                     # OLD RULE (Bots)
                     # 2. Existing Own Stacks?
-                    for u in self.grid.values():
-                        if u['owner'] == self.turn and u['type'] == req_type:
-                            can_add = True
-                            break
+                    if req_type == 'bot':
+                        can_add = len(self.owner_bot_cells[self.turn]) > 0
                     
                     # 3. Empty Start Zones?
                     if not can_add:

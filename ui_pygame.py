@@ -1,6 +1,7 @@
 import math
 import pygame
 
+from agents.mcts import MCTS, SatellitesAdapter
 from engine import SatellitesGame
 
 # ==========================================
@@ -10,6 +11,8 @@ from engine import SatellitesGame
 class SatellitesUI:
     def __init__(self, game):
         self.game = game
+        self.ai_adapter = SatellitesAdapter()
+        self.mcts = MCTS(self.ai_adapter, iterations=120, rollout_depth=16, seed=1)
         pygame.init()
         self.width = 1000
         self.height = 800
@@ -38,6 +41,20 @@ class SatellitesUI:
             for c in range(row_w):
                 x = start_x + c * (self.hex_width * 1.0) 
                 self.hex_centers[(r,c)] = (int(x), int(y))
+
+        self.show_weights_panel = False
+        self.player_control = {0: "human", 1: "human"}
+        self.ai_move_cooldown_ms = 80
+        self.last_ai_move_ms = 0
+        self.weight_rows = [
+            ("Win score", "score_diff", 5.0, 0.0, 300.0),
+            ("Kill 3+ bots", "move_tank_adj_enemy_bot", 0.2, 0.0, 8.0),
+            ("Kill bots @ artefact", "move_bot_capture", 0.5, 0.0, 12.0),
+            ("Kill smaller tank", "move_tank_vs_tank_win", 0.2, 0.0, 8.0),
+            ("Block lanes", "add_tank_near_artefact", 0.2, 0.0, 8.0),
+            ("Reinforce near tank", "sat_add_tank_bonus", 0.2, 0.0, 8.0),
+        ]
+        self.weight_buttons = []
 
     def hex_corners(self, center, radius):
         points = []
@@ -89,6 +106,13 @@ class SatellitesUI:
         # Info Message
         msg_surf = self.font.render(self.game.info_message, True, (200, 200, 200))
         self.screen.blit(msg_surf, (20, 70))
+        mode_text = (
+            f"P0:{self.player_control[0].upper()}  "
+            f"P1:{self.player_control[1].upper()}  "
+            f"[1]/[2] Toggle   [T] Toggle current   [W] Weights"
+        )
+        mode_surf = self.font.render(mode_text, True, (180, 180, 180))
+        self.screen.blit(mode_surf, (20, 95))
         
         # Draw Hex Grid
         for r in range(9):
@@ -227,8 +251,58 @@ class SatellitesUI:
             
             reason = self.font.render("Game Over", True, (255,255,255))
             self.screen.blit(reason, (cx - reason.get_width()//2, cy + 20))
+
+        if self.show_weights_panel:
+            self.draw_weights_panel()
         
         pygame.display.flip()
+
+    def is_ai_turn(self):
+        if self.game.state == "GAME_OVER":
+            return False
+        return self.player_control.get(self.game.turn, "human") == "ai"
+
+    def toggle_player_control(self, player):
+        cur = self.player_control.get(player, "human")
+        self.player_control[player] = "ai" if cur == "human" else "human"
+
+    def maybe_run_ai_turn(self):
+        if not self.is_ai_turn():
+            return
+        now = pygame.time.get_ticks()
+        if now - self.last_ai_move_ms < self.ai_move_cooldown_ms:
+            return
+        self.last_ai_move_ms = now
+        try:
+            action, _ = self.mcts.select_action(self.game)
+            ok = self.game.apply_action(action)
+            if not ok:
+                self.game.info_message = f"AI chose illegal action: {action}"
+        except ValueError:
+            # No legal actions available
+            pass
+
+    def draw_weights_panel(self):
+        panel = pygame.Rect(self.width - 300, 80, 285, 280)
+        pygame.draw.rect(self.screen, (25, 25, 25), panel)
+        pygame.draw.rect(self.screen, (200, 200, 200), panel, 2)
+        title = self.font.render("AI Weights (W to hide)", True, (255, 255, 255))
+        self.screen.blit(title, (panel.x + 10, panel.y + 8))
+
+        self.weight_buttons = []
+        weights = self.ai_adapter.get_weights()
+        y = panel.y + 40
+        for label, key, step, lo, hi in self.weight_rows:
+            minus_rect = pygame.Rect(panel.x + 8, y + 2, 24, 20)
+            plus_rect = pygame.Rect(panel.x + 250, y + 2, 24, 20)
+            value = weights.get(key, 0.0)
+
+            self.draw_button(minus_rect, "-", (100, 50, 50))
+            self.draw_button(plus_rect, "+", (50, 100, 50))
+            line = self.font.render(f"{label}: {value:.2f}", True, (220, 220, 220))
+            self.screen.blit(line, (panel.x + 40, y))
+            self.weight_buttons.append((minus_rect, plus_rect, key, step, lo, hi))
+            y += 38
 
     def run(self):
         running = True
@@ -241,6 +315,16 @@ class SatellitesUI:
                 
                 # FIX: Keyboard input
                 elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_w:
+                        self.show_weights_panel = not self.show_weights_panel
+                    elif event.key == pygame.K_1:
+                        self.toggle_player_control(0)
+                    elif event.key == pygame.K_2:
+                        self.toggle_player_control(1)
+                    elif event.key == pygame.K_t:
+                        self.toggle_player_control(self.game.turn)
+                    if self.is_ai_turn():
+                        continue
                     if self.game.state == "CHOOSE_DIRECTION":
                         if event.key == pygame.K_LEFT:
                             self.game.set_distribution_direction(False)  # Counter-clockwise
@@ -270,6 +354,10 @@ class SatellitesUI:
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     mx, my = pygame.mouse.get_pos()
+                    if self.show_weights_panel and self.handle_weights_click(mx, my):
+                        continue
+                    if self.is_ai_turn():
+                        continue
                     
                     if self.game.state == "CHOOSE_DIRECTION":
                         if hasattr(self, 'cw_btn') and self.cw_btn.collidepoint(mx, my):
@@ -308,9 +396,22 @@ class SatellitesUI:
                         if best_hex:
                             self.game.handle_click(best_hex[0], best_hex[1])
             
+            self.maybe_run_ai_turn()
             self.draw()
             
         pygame.quit()
+
+    def handle_weights_click(self, mx, my):
+        for minus_rect, plus_rect, key, step, lo, hi in self.weight_buttons:
+            if minus_rect.collidepoint(mx, my):
+                cur = self.ai_adapter.get_weights().get(key, 0.0)
+                self.ai_adapter.set_weight(key, max(lo, cur - step))
+                return True
+            if plus_rect.collidepoint(mx, my):
+                cur = self.ai_adapter.get_weights().get(key, 0.0)
+                self.ai_adapter.set_weight(key, min(hi, cur + step))
+                return True
+        return False
 
 def main():
     game = SatellitesGame()
