@@ -165,21 +165,43 @@ Phase 1 — MCTS Baseline
 
 Implement PUCT-style MCTS with:
 
-Prior-guided exploration
+Heuristic Policy (For MCTS)
 
-Progressive widening for movement-heavy nodes
+Heuristics are permitted for:
 
-Heuristic leaf evaluation using:
+Leaf evaluation in MCTS
 
-Score differential
+Action priors for PUCT
 
-Artefact threats
+Move ordering and progressive widening
 
-Tank shooting threats
+Heuristics must never:
 
-Mobility
+Alter legal move generation
 
-Satellite charge tempo
+Override rule correctness
+
+Introduce nondeterminism
+
+Heuristic categories to consider:
+
+Score differential and near-win pressure
+
+Immediate capture threats
+
+Distance-to-artefact race positioning
+
+Tank dominance and adjacency
+
+Bot safety relative to enemy tanks
+
+Lane blocking between bots and artefacts
+
+Satellite charge tempo and denial (avoid gifting opponent power turns)
+
+Heuristic weights are experimental and may be tuned.
+
+No heuristic should hard-code a specific strategic doctrine; the system must allow multiple viable strategies to emerge through search and/or learning.
 
 Random playouts are acceptable only for debugging.
 
