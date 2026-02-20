@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import math
 import random
+import time
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 
@@ -46,16 +48,27 @@ class MCTSAdapter(Protocol):
     def action_prior(self, state: Any, action: Action, player: Player) -> float:
         ...
 
+    def tactical_priority(self, state: Any, action: Action, player: Player) -> int:
+        ...
+
+    def state_key(self, state: Any) -> Any:
+        ...
+
 
 @dataclass
 class Node:
     parent: Optional["Node"] = None
     action_from_parent: Optional[Action] = None
     player_to_move: Player = 0
+    state_key: Any = None
     visits: int = 0
     value_sum: float = 0.0
-    children: Dict[Action, "Node"] = field(default_factory=dict)
+    child_actions: List[Action] = field(default_factory=list)
+    child_nodes: List["Node"] = field(default_factory=list)
+    child_priors: List[float] = field(default_factory=list)
+    action_to_child_idx: Dict[Action, int] = field(default_factory=dict)
     untried_actions: Optional[List[Action]] = None
+    untried_priors: Optional[List[float]] = None
 
     @property
     def value(self) -> float:
@@ -70,37 +83,88 @@ class MCTS:
         iterations: int = 400,
         c_puct: float = 1.41,
         rollout_depth: int = 60,
+        rollout_greedy_prob: float = 0.85,
+        widening_base: int = 8,
+        widening_step: int = 5,
+        widening_every: int = 25,
+        use_transposition: bool = True,
         seed: Optional[int] = None,
     ) -> None:
         self.adapter = adapter
         self.iterations = iterations
         self.c_puct = c_puct
         self.rollout_depth = rollout_depth
+        self.rollout_greedy_prob = rollout_greedy_prob
+        self.widening_base = widening_base
+        self.widening_step = widening_step
+        self.widening_every = widening_every
+        self.use_transposition = use_transposition
+        self.tt_stats: Dict[Any, List[float]] = {}
+        self.tt_legal: Dict[Any, Tuple[Action, ...]] = {}
+        self.tt_ordered: Dict[Any, Tuple[Tuple[Action, ...], Tuple[float, ...]]] = {}
         self.rng = random.Random(seed)
 
     def select_action(self, root_state: Any) -> Tuple[Action, Dict[str, float]]:
+        return self._select_action_internal(root_state, max_iterations=self.iterations)
+
+    def select_action_for_time(
+        self,
+        root_state: Any,
+        max_time_s: float,
+        min_iterations: int = 1,
+    ) -> Tuple[Action, Dict[str, float]]:
+        deadline = time.perf_counter() + max(0.01, max_time_s)
+        return self._select_action_internal(
+            root_state,
+            max_iterations=None,
+            deadline=deadline,
+            min_iterations=max(1, min_iterations),
+        )
+
+    def _select_action_internal(
+        self,
+        root_state: Any,
+        *,
+        max_iterations: Optional[int],
+        deadline: Optional[float] = None,
+        min_iterations: int = 1,
+    ) -> Tuple[Action, Dict[str, float]]:
         work_state = self.adapter.clone(root_state)
+        root_key = self.adapter.state_key(work_state)
         root = Node(
             player_to_move=self.adapter.current_player(work_state),
+            state_key=root_key,
         )
-        root.untried_actions = self.adapter.legal_actions(work_state)
+        if self.use_transposition and root_key in self.tt_stats:
+            s = self.tt_stats[root_key]
+            root.visits = int(s[0])
+            root.value_sum = float(s[1])
+        root.untried_actions, root.untried_priors = self._ordered_actions(work_state, root.player_to_move)
         if not root.untried_actions:
             raise ValueError("No legal actions from root state.")
 
-        for _ in range(self.iterations):
+        iters_done = 0
+        while True:
+            if max_iterations is not None and iters_done >= max_iterations:
+                break
+            if deadline is not None and iters_done >= min_iterations and time.perf_counter() >= deadline:
+                break
             node, path_tokens = self._select_and_expand(root, work_state)
             value = self._simulate_from_clone(work_state, node.player_to_move)
             self._backpropagate(node, value)
             self._undo_tokens(work_state, path_tokens)
+            iters_done += 1
 
-        best_action, best_child = max(
-            root.children.items(),
-            key=lambda kv: kv[1].visits,
-        )
+        if not root.child_nodes:
+            raise ValueError("No child nodes expanded from root.")
+        best_idx = max(range(len(root.child_nodes)), key=lambda i: root.child_nodes[i].visits)
+        best_action = root.child_actions[best_idx]
+        best_child = root.child_nodes[best_idx]
         stats = {
             "root_visits": float(root.visits),
             "best_action_visits": float(best_child.visits),
             "best_action_value": best_child.value,
+            "iterations": float(iters_done),
         }
         return best_action, stats
 
@@ -108,24 +172,26 @@ class MCTS:
         path_tokens: List[Any] = []
         while not self.adapter.is_terminal(state):
             if node.untried_actions is None:
-                node.untried_actions = self.adapter.legal_actions(state)
-            if node.untried_actions:
+                node.untried_actions, node.untried_priors = self._ordered_actions(state, node.player_to_move)
+            total_actions = len(node.child_nodes) + len(node.untried_actions)
+            allowed = self.widening_base + (node.visits // self.widening_every) * self.widening_step
+            if node.untried_actions and len(node.child_nodes) < min(total_actions, allowed):
                 child, token = self._expand(node, state)
                 path_tokens.append(token)
                 return child, path_tokens
-            action, child = self._best_ucb_edge(node)
+            edge_idx, action, child = self._best_ucb_edge(node)
             success, token = self.adapter.apply_action_with_undo(state, action)
             if not success:
                 # Defensive: if engine rejects, prune edge and retry.
-                del node.children[action]
+                self._remove_child_at(node, edge_idx)
                 continue
             path_tokens.append(token)
             node = child
         return node, path_tokens
 
     def _expand(self, node: Node, state: Any) -> Tuple[Node, Any]:
-        idx = self.rng.randrange(len(node.untried_actions))
-        action = node.untried_actions.pop(idx)
+        action = node.untried_actions.pop(0)
+        prior = node.untried_priors.pop(0) if node.untried_priors else 0.0
         success, token = self.adapter.apply_action_with_undo(state, action)
         if not success:
             # Defensive fallback: treat as dead-end leaf.
@@ -135,19 +201,85 @@ class MCTS:
                 player_to_move=node.player_to_move,
             )
             child.untried_actions = []
-            node.children[action] = child
+            child.untried_priors = []
+            self._add_child(node, action, prior, child)
             return child, None
         child = Node(
             parent=node,
             action_from_parent=action,
             player_to_move=self.adapter.current_player(state),
+            state_key=self.adapter.state_key(state),
         )
-        child.untried_actions = self.adapter.legal_actions(state)
-        node.children[action] = child
+        if self.use_transposition and child.state_key in self.tt_stats:
+            s = self.tt_stats[child.state_key]
+            child.visits = int(s[0])
+            child.value_sum = float(s[1])
+        child.untried_actions, child.untried_priors = self._ordered_actions(state, child.player_to_move)
+        self._add_child(node, action, prior, child)
         return child, token
 
-    def _best_ucb_edge(self, node: Node) -> Tuple[Action, Node]:
-        assert node.children, "UCB selection requires existing children."
+    def _add_child(self, node: Node, action: Action, prior: float, child: Node) -> None:
+        idx = len(node.child_nodes)
+        node.action_to_child_idx[action] = idx
+        node.child_actions.append(action)
+        node.child_nodes.append(child)
+        node.child_priors.append(prior)
+
+    def _remove_child_at(self, node: Node, idx: int) -> None:
+        action = node.child_actions[idx]
+        del node.action_to_child_idx[action]
+        last = len(node.child_nodes) - 1
+        if idx != last:
+            node.child_actions[idx] = node.child_actions[last]
+            node.child_nodes[idx] = node.child_nodes[last]
+            node.child_priors[idx] = node.child_priors[last]
+            moved_action = node.child_actions[idx]
+            node.action_to_child_idx[moved_action] = idx
+        node.child_actions.pop()
+        node.child_nodes.pop()
+        node.child_priors.pop()
+
+    def _legal_actions_for_state(self, state: Any) -> List[Action]:
+        if not self.use_transposition:
+            return self.adapter.legal_actions(state)
+        key = self.adapter.state_key(state)
+        cached = self.tt_legal.get(key)
+        if cached is not None:
+            return list(cached)
+        actions = self.adapter.legal_actions(state)
+        self.tt_legal[key] = tuple(actions)
+        return actions
+
+    def _ordered_actions(self, state: Any, player: Player) -> Tuple[List[Action], List[float]]:
+        if self.use_transposition:
+            k = (self.adapter.state_key(state), player)
+            cached = self.tt_ordered.get(k)
+            if cached is not None:
+                return list(cached[0]), list(cached[1])
+        actions = self._legal_actions_for_state(state)
+        if not actions:
+            return [], []
+        if not hasattr(self.adapter, "action_prior"):
+            priors = [0.0] * len(actions)
+            return actions, priors
+        scored = []
+        tactical_available = hasattr(self.adapter, "tactical_priority")
+        for a in actions:
+            prior = float(self.adapter.action_prior(state, a, player))
+            if tactical_available:
+                tact = int(self.adapter.tactical_priority(state, a, player))
+                scored.append((tact, prior, a))
+            else:
+                scored.append((0, prior, a))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        ordered_actions = [x[2] for x in scored]
+        ordered_priors = [x[1] for x in scored]
+        if self.use_transposition:
+            self.tt_ordered[(self.adapter.state_key(state), player)] = (tuple(ordered_actions), tuple(ordered_priors))
+        return ordered_actions, ordered_priors
+
+    def _best_ucb_edge(self, node: Node) -> Tuple[int, Action, Node]:
+        assert node.child_nodes, "UCB selection requires existing children."
         log_n = math.log(max(1, node.visits))
 
         def ucb(child: Node) -> float:
@@ -157,8 +289,8 @@ class MCTS:
             explore = self.c_puct * math.sqrt(log_n / child.visits)
             return exploit + explore
 
-        action, child = max(node.children.items(), key=lambda kv: ucb(kv[1]))
-        return action, child
+        best_idx = max(range(len(node.child_nodes)), key=lambda i: ucb(node.child_nodes[i]))
+        return best_idx, node.child_actions[best_idx], node.child_nodes[best_idx]
 
     def _simulate_from_clone(self, state: Any, rollout_player: Player) -> float:
         sim_state = self.adapter.clone(state)
@@ -180,18 +312,30 @@ class MCTS:
     def _sample_action(self, state: Any, actions: List[Action], player: Player) -> Action:
         if not hasattr(self.adapter, "action_prior"):
             return self.rng.choice(actions)
-        priors = []
-        for a in actions:
-            p = float(self.adapter.action_prior(state, a, player))
-            priors.append(max(0.01, p + 1.0))
-        total = sum(priors)
+        priors = [float(self.adapter.action_prior(state, a, player)) for a in actions]
+        if hasattr(self.adapter, "tactical_priority"):
+            tactical = [int(self.adapter.tactical_priority(state, a, player)) for a in actions]
+            best_t = max(tactical) if tactical else 0
+            if best_t >= 80:
+                idx = max(range(len(actions)), key=lambda i: (tactical[i], priors[i]))
+                return actions[idx]
+
+        # Fast greedy-biased policy over top-k actions.
+        top_k = min(6, len(actions))
+        top_idx = sorted(range(len(actions)), key=lambda i: priors[i], reverse=True)[:top_k]
+        if self.rng.random() < self.rollout_greedy_prob:
+            return actions[top_idx[0]]
+        # Weighted sample only among top-k to reduce noise and per-step overhead.
+        top_actions = [actions[i] for i in top_idx]
+        top_weights = [max(0.01, priors[i] + 1.0) for i in top_idx]
+        total = sum(top_weights)
         r = self.rng.random() * total
         acc = 0.0
-        for a, w in zip(actions, priors):
+        for a, w in zip(top_actions, top_weights):
             acc += w
             if acc >= r:
                 return a
-        return actions[-1]
+        return top_actions[-1]
 
     def _undo_tokens(self, state: Any, tokens: List[Any]) -> None:
         for token in reversed(tokens):
@@ -204,6 +348,13 @@ class MCTS:
         while cur is not None:
             cur.visits += 1
             cur.value_sum += cur_value
+            if self.use_transposition and cur.state_key is not None:
+                s = self.tt_stats.get(cur.state_key)
+                if s is None:
+                    self.tt_stats[cur.state_key] = [1.0, cur_value]
+                else:
+                    s[0] += 1.0
+                    s[1] += cur_value
             cur_value = -cur_value
             cur = cur.parent
 
@@ -230,13 +381,18 @@ class SatellitesAdapter:
         "add_tank_near_enemy_bot": 1.0,
         "add_bot_dist_gain": 2.0,
         "add_bot_tank_threat_penalty": 1.5,
-        "move_bot_capture": 4.0,
+        "move_bot_capture": 10.0,
+        "move_bot_capture_stack_scale": 0.8,
         "move_bot_dist_delta": 0.5,
         "move_bot_tank_threat_penalty": 2.5,
+        "move_bot_safe_approach": 2.0,
         "move_tank_adj_enemy_bot": 1.6,
         "move_tank_vs_tank_win": 1.0,
         "move_tank_vs_tank_lose": 0.8,
         "move_tank_near_artefact": 0.8,
+        "eval_safe_bot_near_artefact": 35.0,
+        "add_bot_stack_near_artefact": 2.2,
+        "gifted_power_turn": 45.0,
     }
 
     def __init__(self, weights: Optional[Dict[str, float]] = None):
@@ -253,6 +409,17 @@ class SatellitesAdapter:
         if name not in self.weights:
             raise KeyError(f"Unknown weight: {name}")
         self.weights[name] = float(value)
+
+    def save_weights(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.weights, f, indent=2, sort_keys=True)
+
+    def load_weights(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if k in self.weights:
+                self.weights[k] = float(v)
 
     def clone(self, state: Any) -> Any:
         if hasattr(state, "clone"):
@@ -376,6 +543,53 @@ class SatellitesAdapter:
                 opp_near += 1
         val += w["tanks_near_artefact"] * (my_near - opp_near)
 
+        # Prefer safe bot stacks that are close to remaining artefacts.
+        safe_my = 0.0
+        safe_opp = 0.0
+        if artefacts:
+            for pos, ct in my_bots:
+                d = min(state.get_hex_distance(pos, a) for a in artefacts)
+                if d <= 2 and not self._is_adj_enemy_tank(state, player, pos):
+                    safe_my += (3 - d) * (1.0 + 0.2 * ct)
+            for pos, ct in opp_bots:
+                d = min(state.get_hex_distance(pos, a) for a in artefacts)
+                if d <= 2 and not self._is_adj_enemy_tank(state, enemy, pos):
+                    safe_opp += (3 - d) * (1.0 + 0.2 * ct)
+        val += w["eval_safe_bot_near_artefact"] * (safe_my - safe_opp)
+
+        # Penalize states that appear to hand the opponent a strong next turn.
+        opp_move_bot_ch = max((sat["charges"] for sat in state.satellites if sat["type"] == "move_bot"), default=0)
+        opp_move_tank_ch = max((sat["charges"] for sat in state.satellites if sat["type"] == "move_tank"), default=0)
+        opp_add_tank_ch = max((sat["charges"] for sat in state.satellites if sat["type"] == "add_tank"), default=0)
+
+        power_threat = 0.0
+        if opp_move_bot_ch >= 3 and artefacts:
+            opp_best_d = min(self._min_bot_dist(state, enemy, a) for a in artefacts)
+            power_threat += max(0.0, 4.0 - float(opp_best_d))
+
+        if opp_move_tank_ch >= 3:
+            my_bots_exposed = sum(1 for pos, _ in my_bots if self._is_adj_enemy_tank(state, player, pos))
+            my_bots_near_art = sum(
+                1 for pos, _ in my_bots
+                if artefacts and min(state.get_hex_distance(pos, a) for a in artefacts) <= 2
+            )
+            power_threat += 0.8 * my_bots_exposed + 0.5 * my_bots_near_art
+
+        if opp_add_tank_ch >= 2 and artefacts:
+            candidate = 0
+            for a in artefacts:
+                for nr, nc in state.get_hex_neighbors(a[0], a[1]):
+                    u = state.grid.get((nr, nc))
+                    if u is None or (u["owner"] == enemy and u["type"] == "tank"):
+                        candidate += 1
+                        if candidate >= 4:
+                            break
+                if candidate >= 4:
+                    break
+            power_threat += 0.2 * candidate
+
+        val -= w["gifted_power_turn"] * power_threat
+
         # Squash to [-1, 1] for stable MCTS backups.
         return max(-1.0, min(1.0, val / 300.0))
 
@@ -402,6 +616,7 @@ class SatellitesAdapter:
         if kind == "add":
             r, c = action[1], action[2]
             pos = (r, c)
+            cur = state.grid.get(pos)
             if "tank" in (state.action_type or ""):
                 p = 0.5
                 if any(state.get_hex_distance(pos, a) <= 2 for a in state.artefacts):
@@ -415,6 +630,10 @@ class SatellitesAdapter:
             if state.artefacts:
                 d = min(state.get_hex_distance(pos, a) for a in state.artefacts)
                 p += max(0.0, w["add_bot_dist_gain"] - 0.3 * d)
+                # Favor reinforcing existing bot stacks that are near artefacts and safe.
+                if cur and cur["owner"] == player and cur["type"] == "bot" and not self._is_adj_enemy_tank(state, player, pos):
+                    p += w["add_bot_stack_near_artefact"] * max(0.0, 3.0 - d)
+                    p += 0.1 * cur["count"]
             if self._is_adj_enemy_tank(state, player, pos):
                 p -= w["add_bot_tank_threat_penalty"]
             return p
@@ -427,10 +646,13 @@ class SatellitesAdapter:
                 p = 0.5
                 if end in state.artefacts:
                     p += w["move_bot_capture"]
+                    p += w["move_bot_capture_stack_scale"] * amount
                 if state.artefacts:
                     d0 = min(state.get_hex_distance(start, a) for a in state.artefacts)
                     d1 = min(state.get_hex_distance(end, a) for a in state.artefacts)
                     p += w["move_bot_dist_delta"] * (d0 - d1)
+                    if d1 < d0 and not self._is_adj_enemy_tank(state, player, end):
+                        p += w["move_bot_safe_approach"]
                 if self._is_adj_enemy_tank(state, player, end):
                     p -= w["move_bot_tank_threat_penalty"]
                 return p + 0.1 * amount
@@ -438,10 +660,95 @@ class SatellitesAdapter:
             for nr, nc in state.get_hex_neighbors(end[0], end[1]):
                 tgt = state.grid.get((nr, nc))
                 if tgt and tgt["owner"] == enemy and tgt["type"] == "bot":
-                    p += w["move_tank_adj_enemy_bot"]
+                    p += w["move_tank_adj_enemy_bot"] * tgt["count"]
                 if tgt and tgt["owner"] == enemy and tgt["type"] == "tank":
                     p += w["move_tank_vs_tank_win"] if amount >= tgt["count"] else -w["move_tank_vs_tank_lose"]
             if state.artefacts and any(state.get_hex_distance(end, a) <= 2 for a in state.artefacts):
                 p += w["move_tank_near_artefact"]
             return p
         return 0.0
+
+    def tactical_priority(self, state: Any, action: Action, player: Player) -> int:
+        enemy = 1 - player
+        kind = action[0]
+        if kind == "move":
+            start, end, amount = action[1], action[2], action[3]
+            u = state.grid.get(start)
+            if not u:
+                return 0
+
+            # Highest: bot artefact captures (win condition driver), scaled by stack.
+            if u["type"] == "bot" and end in state.artefacts:
+                return 100 + min(20, amount)
+
+            # Tank tactical captures.
+            if u["type"] == "tank":
+                target = state.grid.get(end)
+                if target and target["owner"] == enemy and target["type"] == "bot":
+                    near_art = any(
+                        state.get_hex_distance(end, a) <= 2 for a in state.artefacts
+                    ) if state.artefacts else False
+                    return 85 + (10 if near_art else 0) + min(10, target["count"])
+                if target and target["owner"] == enemy and target["type"] == "tank":
+                    return 75 if amount > target["count"] else 10
+            return 20
+
+        if kind == "add":
+            r, c = action[1], action[2]
+            pos = (r, c)
+            # Tank adds for blocking lanes near artefacts or reinforcing near enemy tanks.
+            if "tank" in (state.action_type or ""):
+                score = 25
+                if any(state.get_hex_distance(pos, a) <= 2 for a in state.artefacts):
+                    score += 20
+                for nr, nc in state.get_hex_neighbors(r, c):
+                    u = state.grid.get((nr, nc))
+                    if u and u["owner"] == enemy and u["type"] == "tank":
+                        score += 15
+                return score
+            # Bot adds are tactical when reinforcing safe near-artefact stacks.
+            cur = state.grid.get(pos)
+            if cur and cur["owner"] == player and cur["type"] == "bot":
+                d = min((state.get_hex_distance(pos, a) for a in state.artefacts), default=99)
+                if d <= 2 and not self._is_adj_enemy_tank(state, player, pos):
+                    return 45 - 10 * d
+            return 15
+
+        if kind in ("select_satellite", "set_direction"):
+            return 10
+
+        return 0
+
+    def state_key(self, state: Any) -> Any:
+        # Fast, order-independent checksum for occupied cells.
+        grid_checksum = 0
+        for (r, c), u in state.grid.items():
+            grid_checksum ^= hash((r, c, u["owner"], u["type"], u["count"]))
+
+        sats_key = tuple((sat["type"], sat["charges"]) for sat in state.satellites)
+        stamp = (
+            state.turn,
+            state.state,
+            state.active_satellite_idx,
+            state.actions_remaining,
+            state.picked_up_charges,
+            state.action_type,
+            state.selected_hex,
+            state.pending_move_dest,
+            state.pending_move_max,
+            state.move_amount_selection,
+            getattr(state, "distribution_direction", None),
+            tuple(state.scores),
+            tuple(sorted(state.artefacts)),
+            sats_key,
+            state.winner,
+            state.turn_count,
+            len(state.grid),
+            grid_checksum,
+        )
+        cache_stamp = getattr(state, "_mcts_key_stamp", None)
+        if cache_stamp == stamp:
+            return state._mcts_key_cache
+        state._mcts_key_stamp = stamp
+        state._mcts_key_cache = stamp
+        return stamp

@@ -220,3 +220,84 @@ def test_mcts_smoke_selects_legal_action() -> None:
     mcts = MCTS(adapter, iterations=10, rollout_depth=6, seed=1)
     action, _ = mcts.select_action(game)
     assert action in game.legal_actions()
+
+
+def test_bot_capture_prior_beats_non_capture_move() -> None:
+    game = SatellitesGame(headless=True)
+    game.grid = {
+        (4, 4): {"owner": 0, "type": "bot", "count": 3},
+    }
+    game.artefacts = [(4, 5)]
+    game.is_artefact_cell = [False] * game.num_cells
+    game.is_artefact_cell[game.coord_to_cell_id[(4, 5)]] = True
+    game.turn = 0
+    game.state = "PERFORM_ACTIONS"
+    game.action_type = "move_bot"
+    game.actions_remaining = 1
+
+    adapter = SatellitesAdapter()
+    capture = ("move", (4, 4), (4, 5), 3)
+    non_capture = ("move", (4, 4), (4, 3), 3)
+
+    assert adapter.action_prior(game, capture, 0) > adapter.action_prior(game, non_capture, 0)
+
+
+def test_adapter_weight_save_load_roundtrip(tmp_path) -> None:
+    adapter = SatellitesAdapter()
+    adapter.set_weight("move_bot_capture", 9.25)
+    path = tmp_path / "weights.json"
+    adapter.save_weights(str(path))
+
+    adapter2 = SatellitesAdapter()
+    adapter2.load_weights(str(path))
+    assert abs(adapter2.get_weights()["move_bot_capture"] - 9.25) < 1e-9
+
+
+def test_eval_penalizes_opponent_power_turn_threat() -> None:
+    game = SatellitesGame(headless=True)
+    game.grid = {
+        (4, 4): {"owner": 1, "type": "bot", "count": 2},  # opponent bot near artefact
+        (3, 3): {"owner": 0, "type": "bot", "count": 2},
+    }
+    game.artefacts = [(4, 5)]
+    game.is_artefact_cell = [False] * game.num_cells
+    game.is_artefact_cell[game.coord_to_cell_id[(4, 5)]] = True
+    for sat in game.satellites:
+        sat["charges"] = 0
+
+    adapter = SatellitesAdapter()
+    v_base = adapter.evaluate(game, 0)
+
+    for sat in game.satellites:
+        if sat["type"] == "move_bot":
+            sat["charges"] = 3
+            break
+
+    v_threat = adapter.evaluate(game, 0)
+    assert v_threat < v_base
+
+
+def test_tactical_priority_prefers_artefact_capture() -> None:
+    game = SatellitesGame(headless=True)
+    game.grid = {(4, 4): {"owner": 0, "type": "bot", "count": 3}}
+    game.artefacts = [(4, 5)]
+    game.is_artefact_cell = [False] * game.num_cells
+    game.is_artefact_cell[game.coord_to_cell_id[(4, 5)]] = True
+    game.turn = 0
+    game.state = "PERFORM_ACTIONS"
+    game.action_type = "move_bot"
+    game.actions_remaining = 1
+
+    adapter = SatellitesAdapter()
+    capture = ("move", (4, 4), (4, 5), 3)
+    normal = ("move", (4, 4), (4, 3), 3)
+    assert adapter.tactical_priority(game, capture, 0) > adapter.tactical_priority(game, normal, 0)
+
+
+def test_state_key_changes_with_state_mutation() -> None:
+    game = SatellitesGame(headless=True)
+    adapter = SatellitesAdapter()
+    k0 = adapter.state_key(game)
+    game.scores[0] += 1
+    k1 = adapter.state_key(game)
+    assert k0 != k1

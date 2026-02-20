@@ -1,4 +1,5 @@
 import math
+import os
 import pygame
 
 from agents.mcts import MCTS, SatellitesAdapter
@@ -46,10 +47,13 @@ class SatellitesUI:
         self.player_control = {0: "human", 1: "human"}
         self.ai_move_cooldown_ms = 80
         self.last_ai_move_ms = 0
+        self.ai_think_ms = 2000
+        self.weights_file = "weights_live.json"
         self.weight_rows = [
             ("Win score", "score_diff", 5.0, 0.0, 300.0),
-            ("Kill 3+ bots", "move_tank_adj_enemy_bot", 0.2, 0.0, 8.0),
-            ("Kill bots @ artefact", "move_bot_capture", 0.5, 0.0, 12.0),
+            ("Capture artefact", "move_bot_capture", 0.5, 0.0, 20.0),
+            ("Earn points", "move_bot_capture_stack_scale", 0.1, 0.0, 5.0),
+            ("Kill bots", "move_tank_adj_enemy_bot", 0.2, 0.0, 8.0),
             ("Kill smaller tank", "move_tank_vs_tank_win", 0.2, 0.0, 8.0),
             ("Block lanes", "add_tank_near_artefact", 0.2, 0.0, 8.0),
             ("Reinforce near tank", "sat_add_tank_bonus", 0.2, 0.0, 8.0),
@@ -109,7 +113,8 @@ class SatellitesUI:
         mode_text = (
             f"P0:{self.player_control[0].upper()}  "
             f"P1:{self.player_control[1].upper()}  "
-            f"[1]/[2] Toggle   [T] Toggle current   [W] Weights"
+            f"AI Think:{self.ai_think_ms}ms  "
+            f"[1]/[2] Toggle   [T] Current   [[/]] Think   [W] Weights   [S] Save [L] Load"
         )
         mode_surf = self.font.render(mode_text, True, (180, 180, 180))
         self.screen.blit(mode_surf, (20, 95))
@@ -274,13 +279,24 @@ class SatellitesUI:
             return
         self.last_ai_move_ms = now
         try:
-            action, _ = self.mcts.select_action(self.game)
+            action, _ = self.mcts.select_action_for_time(self.game, self.ai_think_ms / 1000.0, min_iterations=10)
             ok = self.game.apply_action(action)
             if not ok:
                 self.game.info_message = f"AI chose illegal action: {action}"
         except ValueError:
             # No legal actions available
             pass
+
+    def save_weights_to_file(self):
+        self.ai_adapter.save_weights(self.weights_file)
+        self.game.info_message = f"Saved AI weights: {self.weights_file}"
+
+    def load_weights_from_file(self):
+        if not os.path.exists(self.weights_file):
+            self.game.info_message = f"Weights file missing: {self.weights_file}"
+            return
+        self.ai_adapter.load_weights(self.weights_file)
+        self.game.info_message = f"Loaded AI weights: {self.weights_file}"
 
     def draw_weights_panel(self):
         panel = pygame.Rect(self.width - 300, 80, 285, 280)
@@ -323,6 +339,14 @@ class SatellitesUI:
                         self.toggle_player_control(1)
                     elif event.key == pygame.K_t:
                         self.toggle_player_control(self.game.turn)
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        self.ai_think_ms = max(250, self.ai_think_ms - 250)
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        self.ai_think_ms = min(10000, self.ai_think_ms + 250)
+                    elif event.key == pygame.K_s:
+                        self.save_weights_to_file()
+                    elif event.key == pygame.K_l:
+                        self.load_weights_from_file()
                     if self.is_ai_turn():
                         continue
                     if self.game.state == "CHOOSE_DIRECTION":

@@ -297,19 +297,24 @@ class SatellitesGame:
     def _is_legal_add(self, r, c):
         if self.state != "PERFORM_ACTIONS" or "add" not in (self.action_type or ""):
             return False
+        self._ensure_cache()
         if self.get_player_unit_count(self.turn) >= 20:
             return False
 
         unit_type = 'tank' if 'tank' in self.action_type else 'bot'
+        cid = self.coord_to_cell_id.get((r, c))
+        if cid is None:
+            return False
+        occ_owner = self.unit_owner[cid]
+        occ_kind = self.unit_kind[cid]
         current = self.grid.get((r, c))
 
         if unit_type == 'tank':
             is_own_tank_stack = (
-                current is not None and
-                current['owner'] == self.turn and
-                current['type'] == 'tank'
+                occ_owner == self.turn and
+                occ_kind == 2
             )
-            if current is not None and not is_own_tank_stack:
+            if occ_owner != -1 and not is_own_tank_stack:
                 return False
             opp_starts = [(8,3), (8,4)] if self.turn == 0 else [(0,3), (0,4)]
             if (r, c) in opp_starts:
@@ -326,16 +331,19 @@ class SatellitesGame:
     def _is_legal_move(self, start, end, amount):
         if self.state != "PERFORM_ACTIONS" or "move" not in (self.action_type or ""):
             return False
-        if start not in self.grid:
+        self._ensure_cache()
+        sid = self.coord_to_cell_id.get(start)
+        eid = self.coord_to_cell_id.get(end)
+        if sid is None or eid is None:
             return False
-        cell = self.grid[start]
-        if cell['owner'] != self.turn:
+        if self.unit_owner[sid] != self.turn:
             return False
-        if amount < 1 or amount > cell['count']:
+        if amount < 1 or amount > self.unit_count[sid]:
             return False
 
         req_type = 'tank' if 'tank' in self.action_type else 'bot'
-        if cell['type'] != req_type:
+        src_kind = 'tank' if self.unit_kind[sid] == 2 else ('bot' if self.unit_kind[sid] == 1 else None)
+        if src_kind != req_type:
             return False
 
         if end not in self.get_hex_neighbors(start[0], start[1]):
@@ -345,18 +353,18 @@ class SatellitesGame:
         if end in opp_starts:
             return False
 
-        move_type = cell['type']
+        move_type = src_kind
         if move_type == 'tank' and end in self.artefacts:
             return False
 
-        target = self.grid.get(end)
-        if not target:
+        if self.unit_owner[eid] == -1:
             return True
-        if target['owner'] == self.turn:
-            return target['type'] == move_type
+        if self.unit_owner[eid] == self.turn:
+            target_type = 'tank' if self.unit_kind[eid] == 2 else 'bot'
+            return target_type == move_type
         if move_type == 'bot':
             return False
-        if move_type == 'tank' and target['type'] == 'tank' and target['count'] >= amount:
+        if move_type == 'tank' and self.unit_kind[eid] == 2 and self.unit_count[eid] >= amount:
             return False
         return True
 
@@ -386,9 +394,13 @@ class SatellitesGame:
             return actions
 
         if "move" in (self.action_type or ""):
+            self._ensure_cache()
             req_type = 'tank' if 'tank' in self.action_type else 'bot'
-            for (r, c), unit in sorted(self.grid.items(), key=lambda kv: kv[0]):
-                if unit['owner'] != self.turn or unit['type'] != req_type:
+            source_cells = self.owner_tank_cells[self.turn] if req_type == 'tank' else self.owner_bot_cells[self.turn]
+            for cid in source_cells:
+                r, c = self.cell_id_to_coord[cid]
+                unit = self.grid.get((r, c))
+                if not unit:
                     continue
                 for nr, nc in self.get_hex_neighbors(r, c):
                     for amount in range(1, unit['count'] + 1):
