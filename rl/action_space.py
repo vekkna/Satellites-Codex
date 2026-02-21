@@ -52,8 +52,6 @@ class GlobalActionSpace:
         return self.index_to_action[index]
 
     def legal_action_indices(self, game: SatellitesGame) -> List[int]:
-        if hasattr(game, "legal_action_indices"):
-            return list(game.legal_action_indices(max_move_amount=self.max_move_amount))
         out: List[int] = []
         for action in game.legal_actions():
             idx = self.action_to_index.get(action)
@@ -85,3 +83,4 @@ class GlobalActionSpace:
         for key, v in zip(keys, values):
             pi[key] = float(v / total)
         return pi
+

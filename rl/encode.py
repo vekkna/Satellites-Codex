@@ -4,7 +4,7 @@ from typing import Dict
 
 import numpy as np
 
-from engine import SatellitesGame, _sat_native
+from engine import SatellitesGame
 
 
 class FeatureEncoder:
@@ -17,7 +17,6 @@ class FeatureEncoder:
         "GAME_OVER": 3,
     }
     SAT_TYPES = ("move_tank", "move_bot", "add_tank", "add_bot")
-    SAT_CODE = {name: idx for idx, name in enumerate(SAT_TYPES)}
 
     def __init__(self, game_template: SatellitesGame | None = None):
         self.game_template = game_template or SatellitesGame(headless=True)
@@ -29,35 +28,7 @@ class FeatureEncoder:
         self.feature_dim = self.num_cells * self.cell_feature_size + self.global_feature_size
 
     def encode(self, game: SatellitesGame) -> np.ndarray:
-        if hasattr(game, "encode_features"):
-            return np.asarray(game.encode_features(), dtype=np.float32)
-
         game._ensure_cache()
-        if _sat_native is not None and hasattr(_sat_native, "encode_features"):
-            active_idx = -1 if game.active_satellite_idx is None else int(game.active_satellite_idx)
-            sat_type_codes = [self.SAT_CODE.get(sat["type"], 0) for sat in game.satellites]
-            sat_charges = [int(sat["charges"]) for sat in game.satellites]
-            vec = _sat_native.encode_features(
-                game.unit_owner,
-                game.unit_kind,
-                game.unit_count,
-                game.is_artefact_cell,
-                game.is_p0_start_cell,
-                game.is_p1_start_cell,
-                int(game.turn),
-                int(game.scores[0]),
-                int(game.scores[1]),
-                self._state_code(game.state),
-                active_idx,
-                int(game.actions_remaining),
-                int(game.picked_up_charges),
-                int(game.turn_count),
-                int(max(1, game.MAX_TURNS)),
-                sat_type_codes,
-                sat_charges,
-            )
-            return np.asarray(vec, dtype=np.float32)
-
         feat = np.zeros(self.feature_dim, dtype=np.float32)
         p = 0
 
@@ -113,13 +84,3 @@ class FeatureEncoder:
 
         return feat
 
-    def _state_code(self, state: str) -> int:
-        if state == "GAME_OVER":
-            return 0
-        if state == "CHOOSE_SATELLITE":
-            return 1
-        if state == "CHOOSE_DIRECTION":
-            return 2
-        if state == "PERFORM_ACTIONS":
-            return 3
-        return 255
