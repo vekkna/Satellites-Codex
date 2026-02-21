@@ -1,4 +1,28 @@
 import random
+from pathlib import Path
+import os
+import sys
+
+_NATIVE_ACTION_INDEX = os.environ.get("SAT_USE_NATIVE_ACTION_INDEX", "0") == "1"
+
+try:
+    import satellites_native as _sat_native
+except Exception:
+    _sat_native = None
+    _native_root = Path(__file__).resolve().parent / "native" / "satellites_native" / "target"
+    for _build in ("release", "debug"):
+        _native_dir = _native_root / _build
+        if not _native_dir.exists():
+            continue
+        for _p in (_native_dir, _native_dir / "deps"):
+            _ps = str(_p)
+            if _ps not in sys.path:
+                sys.path.insert(0, _ps)
+        try:
+            import satellites_native as _sat_native
+            break
+        except Exception:
+            _sat_native = None
 
 # ==========================================
 # PART 1: GAME LOGIC (Headless Engine)
@@ -16,6 +40,19 @@ class SatellitesGame:
             self.coord_to_cell_id,
             self.neighbors_by_cell_id,
         ) = self._build_topology()
+        self.neighbor_ids_by_cell_id = tuple(
+            tuple(self.coord_to_cell_id[coord] for coord in neighbors)
+            for neighbors in self.neighbors_by_cell_id
+        )
+        self.edge_ordinal_by_cells = {}
+        self.edge_by_ordinal = []
+        edge_ordinal = 0
+        for sid, nids in enumerate(self.neighbor_ids_by_cell_id):
+            for eid in nids:
+                self.edge_ordinal_by_cells[(sid, eid)] = edge_ordinal
+                self.edge_by_ordinal.append((sid, eid))
+                edge_ordinal += 1
+        self.num_directed_edges = edge_ordinal
         self.num_cells = len(self.cell_id_to_coord)
         self.distance_by_cell_id = self._build_distance_matrix()
         self._grid = {}
@@ -136,6 +173,10 @@ class SatellitesGame:
         new.cell_id_to_coord = self.cell_id_to_coord
         new.coord_to_cell_id = self.coord_to_cell_id
         new.neighbors_by_cell_id = self.neighbors_by_cell_id
+        new.neighbor_ids_by_cell_id = self.neighbor_ids_by_cell_id
+        new.edge_ordinal_by_cells = self.edge_ordinal_by_cells
+        new.edge_by_ordinal = self.edge_by_ordinal
+        new.num_directed_edges = self.num_directed_edges
         new.num_cells = self.num_cells
         new.distance_by_cell_id = self.distance_by_cell_id
 
@@ -417,55 +458,249 @@ class SatellitesGame:
         if "move" in (self.action_type or ""):
             self._ensure_cache()
             req_type = 'tank' if 'tank' in self.action_type else 'bot'
-            source_cells = self.owner_tank_cells[self.turn] if req_type == 'tank' else self.owner_bot_cells[self.turn]
-            opp_start_a, opp_start_b = ((8, 3), (8, 4)) if self.turn == 0 else ((0, 3), (0, 4))
-            opp_start_set = {opp_start_a, opp_start_b}
-            for cid in source_cells:
-                r, c = self.cell_id_to_coord[cid]
-                src_count = self.unit_count[cid]
-                if src_count <= 0:
-                    continue
-                start = (r, c)
-                for nr, nc in self.neighbors_by_cell_id[cid]:
-                    end = (nr, nc)
-                    if end in opp_start_set:
-                        continue
-                    eid = self.coord_to_cell_id[end]
-                    target_owner = self.unit_owner[eid]
-                    target_kind = self.unit_kind[eid]  # 0 empty, 1 bot, 2 tank
-                    target_count = self.unit_count[eid]
-
-                    # Tank cannot enter artefact hex.
-                    if req_type == 'tank' and self.is_artefact_cell[eid]:
-                        continue
-
-                    if target_owner == -1:
-                        for amount in range(1, src_count + 1):
-                            actions.append(('move', start, end, amount))
-                        continue
-
-                    if target_owner == self.turn:
-                        # Merge only with same type.
-                        if (req_type == 'tank' and target_kind == 2) or (req_type == 'bot' and target_kind == 1):
-                            for amount in range(1, src_count + 1):
-                                actions.append(('move', start, end, amount))
-                        continue
-
-                    # Enemy target.
-                    if req_type == 'bot':
-                        continue
-                    # Tank vs enemy bot: any amount legal.
-                    if target_kind == 1:
-                        for amount in range(1, src_count + 1):
-                            actions.append(('move', start, end, amount))
-                        continue
-                    # Tank vs enemy tank: must be strictly larger.
-                    if target_kind == 2 and src_count > target_count:
-                        for amount in range(target_count + 1, src_count + 1):
-                            actions.append(('move', start, end, amount))
+            compact = self._generate_compact_moves(req_type)
+            for sid, eid, amount in compact:
+                actions.append(
+                    (
+                        'move',
+                        self.cell_id_to_coord[sid],
+                        self.cell_id_to_coord[eid],
+                        int(amount),
+                    )
+                )
             return actions
 
         return actions
+
+    def legal_action_indices(self, max_move_amount=20):
+        if max_move_amount < 1 or self.state == "GAME_OVER":
+            return []
+        if self.state == "PERFORM_ACTIONS":
+            self._ensure_cache()
+
+        if _NATIVE_ACTION_INDEX and _sat_native is not None and hasattr(_sat_native, "generate_legal_action_indices"):
+            return list(
+                _sat_native.generate_legal_action_indices(
+                    self._state_code(),
+                    self._action_type_code(),
+                    int(self.turn),
+                    [int(sat.get("charges", 0)) for sat in self.satellites],
+                    self.unit_owner,
+                    self.unit_kind,
+                    self.unit_count,
+                    self.is_artefact_cell,
+                    self.is_p0_start_cell,
+                    self.is_p1_start_cell,
+                    int(min(255, max_move_amount)),
+                )
+            )
+
+        if self.state == "CHOOSE_SATELLITE":
+            out = []
+            for i, sat in enumerate(self.satellites):
+                if sat['charges'] > 0:
+                    out.append(i)
+            return out
+
+        if self.state == "CHOOSE_DIRECTION":
+            return [6, 7]
+
+        if self.state != "PERFORM_ACTIONS":
+            return []
+
+        out = []
+        add_base = 8
+        move_base = add_base + self.num_cells
+
+        if "add" in (self.action_type or ""):
+            self._ensure_cache()
+            if self.owner_total_units[self.turn] >= 20:
+                return []
+            unit_type = 'tank' if 'tank' in self.action_type else 'bot'
+            if unit_type == 'tank':
+                opp_start_mask = self.is_p1_start_cell if self.turn == 0 else self.is_p0_start_cell
+                for cid in range(self.num_cells):
+                    occ_owner = self.unit_owner[cid]
+                    occ_kind = self.unit_kind[cid]
+                    if occ_owner == -1:
+                        if (not opp_start_mask[cid]) and (not self.is_artefact_cell[cid]):
+                            out.append(add_base + cid)
+                    elif occ_owner == self.turn and occ_kind == 2:
+                        out.append(add_base + cid)
+            else:
+                start_a, start_b = ((0, 3), (0, 4)) if self.turn == 0 else ((8, 3), (8, 4))
+                for cid in self.owner_bot_cells[self.turn]:
+                    out.append(add_base + cid)
+                for pos in (start_a, start_b):
+                    cid = self.coord_to_cell_id[pos]
+                    if self.unit_owner[cid] == -1:
+                        out.append(add_base + cid)
+            return out
+
+        if "move" in (self.action_type or ""):
+            self._ensure_cache()
+            req_type = 'tank' if 'tank' in self.action_type else 'bot'
+            compact = self._generate_compact_moves(req_type)
+            for sid, eid, amount in compact:
+                amount_i = int(amount)
+                if amount_i > max_move_amount:
+                    continue
+                edge_ordinal = self.edge_ordinal_by_cells[(sid, eid)]
+                out.append(move_base + edge_ordinal * max_move_amount + (amount_i - 1))
+            return out
+
+        return out
+
+    def apply_action_index(self, action_index, max_move_amount=20):
+        if max_move_amount < 1:
+            return False
+        idx = int(action_index)
+        add_base = 8
+        move_base = add_base + self.num_cells
+        move_span = self.num_directed_edges * max_move_amount
+
+        if 0 <= idx < 6:
+            old_state = self.state
+            old_active = self.active_satellite_idx
+            self.select_satellite(idx)
+            return (self.state != old_state) or (self.active_satellite_idx != old_active)
+        if idx == 6:
+            old_state = self.state
+            self.set_distribution_direction(False)
+            return self.state != old_state or old_state == "CHOOSE_DIRECTION"
+        if idx == 7:
+            old_state = self.state
+            self.set_distribution_direction(True)
+            return self.state != old_state or old_state == "CHOOSE_DIRECTION"
+        if add_base <= idx < move_base:
+            cid = idx - add_base
+            if cid < 0 or cid >= self.num_cells:
+                return False
+            r, c = self.cell_id_to_coord[cid]
+            return self.execute_add(r, c)
+        if move_base <= idx < (move_base + move_span):
+            rel = idx - move_base
+            edge_ordinal = rel // max_move_amount
+            amount = (rel % max_move_amount) + 1
+            if edge_ordinal < 0 or edge_ordinal >= len(self.edge_by_ordinal):
+                return False
+            sid, eid = self.edge_by_ordinal[edge_ordinal]
+            start = self.cell_id_to_coord[sid]
+            end = self.cell_id_to_coord[eid]
+            success, _, _ = self.execute_move(start, end, amount)
+            return success
+        return False
+
+    def _generate_compact_moves(self, req_type):
+        req_kind = 2 if req_type == 'tank' else 1
+        if _sat_native is not None and hasattr(_sat_native, "generate_move_actions"):
+            return _sat_native.generate_move_actions(
+                self.unit_owner,
+                self.unit_kind,
+                self.unit_count,
+                int(self.turn),
+                req_kind,
+                self.is_artefact_cell,
+            )
+
+        compact = []
+        source_cells = self.owner_tank_cells[self.turn] if req_type == 'tank' else self.owner_bot_cells[self.turn]
+        opp_start_a, opp_start_b = ((8, 3), (8, 4)) if self.turn == 0 else ((0, 3), (0, 4))
+        opp_start_set = {self.coord_to_cell_id[opp_start_a], self.coord_to_cell_id[opp_start_b]}
+        for sid in source_cells:
+            src_count = self.unit_count[sid]
+            if src_count <= 0:
+                continue
+            for eid in self.neighbor_ids_by_cell_id[sid]:
+                if eid in opp_start_set:
+                    continue
+                target_owner = self.unit_owner[eid]
+                target_kind = self.unit_kind[eid]  # 0 empty, 1 bot, 2 tank
+                target_count = self.unit_count[eid]
+
+                if req_type == 'tank' and self.is_artefact_cell[eid]:
+                    continue
+
+                if target_owner == -1:
+                    for amount in range(1, src_count + 1):
+                        compact.append((sid, eid, amount))
+                    continue
+
+                if target_owner == self.turn:
+                    if (req_type == 'tank' and target_kind == 2) or (req_type == 'bot' and target_kind == 1):
+                        for amount in range(1, src_count + 1):
+                            compact.append((sid, eid, amount))
+                    continue
+
+                if req_type == 'bot':
+                    continue
+                if target_kind == 1:
+                    for amount in range(1, src_count + 1):
+                        compact.append((sid, eid, amount))
+                    continue
+                if target_kind == 2 and src_count > target_count:
+                    for amount in range(target_count + 1, src_count + 1):
+                        compact.append((sid, eid, amount))
+        return compact
+
+    def _state_code(self):
+        if self.state == "GAME_OVER":
+            return 0
+        if self.state == "CHOOSE_SATELLITE":
+            return 1
+        if self.state == "CHOOSE_DIRECTION":
+            return 2
+        if self.state == "PERFORM_ACTIONS":
+            return 3
+        return 255
+
+    def _action_type_code(self):
+        at = self.action_type or ""
+        if at == "add_tank":
+            return 1
+        if at == "add_bot":
+            return 2
+        if at == "move_tank":
+            return 3
+        if at == "move_bot":
+            return 4
+        return 0
+
+    def to_native_state(self):
+        self._ensure_cache()
+        if _sat_native is None or not hasattr(_sat_native, "NativeSatGame"):
+            return None
+        sat_code = {
+            "move_tank": 0,
+            "move_bot": 1,
+            "add_tank": 2,
+            "add_bot": 3,
+        }
+        sat_type_codes = [sat_code.get(s["type"], 0) for s in self.satellites]
+        sat_charges = [int(s.get("charges", 0)) for s in self.satellites]
+        active_idx = -1 if self.active_satellite_idx is None else int(self.active_satellite_idx)
+        winner = -1 if self.winner is None else int(self.winner)
+        return _sat_native.NativeSatGame(
+            self.unit_owner,
+            self.unit_kind,
+            self.unit_count,
+            self.is_artefact_cell,
+            self.is_p0_start_cell,
+            self.is_p1_start_cell,
+            sat_type_codes,
+            sat_charges,
+            int(self.turn),
+            int(self.scores[0]),
+            int(self.scores[1]),
+            self._state_code(),
+            active_idx,
+            int(self.actions_remaining),
+            int(self.picked_up_charges),
+            self._action_type_code(),
+            int(self.turn_count),
+            int(max(1, self.MAX_TURNS)),
+            winner,
+        )
 
     def get_player_unit_count(self, owner):
         self._ensure_cache()

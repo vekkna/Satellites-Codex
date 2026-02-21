@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import random
 from typing import Deque, List
@@ -19,6 +20,7 @@ from rl.selfplay import TrainingExample, run_selfplay_game
 @dataclass
 class TrainConfig:
     selfplay_games_per_round: int = 4
+    selfplay_workers: int = 1
     rounds: int = 10
     simulations: int = 64
     batch_size: int = 64
@@ -40,6 +42,32 @@ class ReplayBuffer:
     def sample(self, n: int) -> List[TrainingExample]:
         n = min(n, len(self.buf))
         return random.sample(list(self.buf), n)
+
+
+def _run_selfplay_worker(
+    model_state: dict,
+    simulations: int,
+    games: int,
+    seed: int,
+) -> List[TrainingExample]:
+    torch.set_num_threads(1)
+    action_space = GlobalActionSpace()
+    encoder = FeatureEncoder()
+    model = SatellitesPolicyValueNet(encoder.feature_dim, action_space.size).to("cpu")
+    model.load_state_dict(model_state)
+    model.eval()
+    mcts = AlphaMCTS(
+        model,
+        action_space,
+        encoder,
+        simulations=simulations,
+        device="cpu",
+        seed=seed,
+    )
+    out: List[TrainingExample] = []
+    for _ in range(games):
+        out.extend(run_selfplay_game(mcts, encoder))
+    return out
 
 
 class Trainer:
@@ -81,9 +109,32 @@ class Trainer:
                 simulations=self.config.simulations,
                 device=self.config.device,
             )
-            for _ in range(self.config.selfplay_games_per_round):
-                examples = run_selfplay_game(mcts, self.encoder)
-                self.buffer.extend(examples)
+            if self.config.selfplay_workers <= 1:
+                for _ in range(self.config.selfplay_games_per_round):
+                    examples = run_selfplay_game(mcts, self.encoder)
+                    self.buffer.extend(examples)
+            else:
+                workers = min(self.config.selfplay_workers, self.config.selfplay_games_per_round)
+                base = self.config.selfplay_games_per_round // workers
+                rem = self.config.selfplay_games_per_round % workers
+                games_per_worker = [base + (1 if i < rem else 0) for i in range(workers)]
+                model_state = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    futures = []
+                    for i, games in enumerate(games_per_worker):
+                        if games <= 0:
+                            continue
+                        futures.append(
+                            ex.submit(
+                                _run_selfplay_worker,
+                                model_state,
+                                self.config.simulations,
+                                games,
+                                1000 * round_idx + i + 1,
+                            )
+                        )
+                    for fut in as_completed(futures):
+                        self.buffer.extend(fut.result())
 
             if len(self.buffer) == 0:
                 continue
@@ -102,4 +153,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
