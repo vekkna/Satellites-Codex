@@ -387,25 +387,82 @@ class SatellitesGame:
 
         actions = []
         if "add" in (self.action_type or ""):
-            for r in range(9):
-                for c in range(self.row_widths[r]):
-                    if self._is_legal_add(r, c):
+            self._ensure_cache()
+            if self.owner_total_units[self.turn] >= 20:
+                return []
+            unit_type = 'tank' if 'tank' in self.action_type else 'bot'
+            if unit_type == 'tank':
+                opp_start_mask = self.is_p1_start_cell if self.turn == 0 else self.is_p0_start_cell
+                for cid, (r, c) in enumerate(self.cell_id_to_coord):
+                    occ_owner = self.unit_owner[cid]
+                    occ_kind = self.unit_kind[cid]
+                    # Tanks: empty non-opponent-start non-artefact, or own tank stack.
+                    if occ_owner == -1:
+                        if (not opp_start_mask[cid]) and (not self.is_artefact_cell[cid]):
+                            actions.append(('add', r, c))
+                    elif occ_owner == self.turn and occ_kind == 2:
                         actions.append(('add', r, c))
+            else:
+                start_a, start_b = ((0, 3), (0, 4)) if self.turn == 0 else ((8, 3), (8, 4))
+                own_bot_cids = self.owner_bot_cells[self.turn]
+                for cid in own_bot_cids:
+                    r, c = self.cell_id_to_coord[cid]
+                    actions.append(('add', r, c))
+                for pos in (start_a, start_b):
+                    cid = self.coord_to_cell_id[pos]
+                    if self.unit_owner[cid] == -1:
+                        actions.append(('add', pos[0], pos[1]))
             return actions
 
         if "move" in (self.action_type or ""):
             self._ensure_cache()
             req_type = 'tank' if 'tank' in self.action_type else 'bot'
             source_cells = self.owner_tank_cells[self.turn] if req_type == 'tank' else self.owner_bot_cells[self.turn]
+            opp_start_a, opp_start_b = ((8, 3), (8, 4)) if self.turn == 0 else ((0, 3), (0, 4))
+            opp_start_set = {opp_start_a, opp_start_b}
             for cid in source_cells:
                 r, c = self.cell_id_to_coord[cid]
-                unit = self.grid.get((r, c))
-                if not unit:
+                src_count = self.unit_count[cid]
+                if src_count <= 0:
                     continue
-                for nr, nc in self.get_hex_neighbors(r, c):
-                    for amount in range(1, unit['count'] + 1):
-                        if self._is_legal_move((r, c), (nr, nc), amount):
-                            actions.append(('move', (r, c), (nr, nc), amount))
+                start = (r, c)
+                for nr, nc in self.neighbors_by_cell_id[cid]:
+                    end = (nr, nc)
+                    if end in opp_start_set:
+                        continue
+                    eid = self.coord_to_cell_id[end]
+                    target_owner = self.unit_owner[eid]
+                    target_kind = self.unit_kind[eid]  # 0 empty, 1 bot, 2 tank
+                    target_count = self.unit_count[eid]
+
+                    # Tank cannot enter artefact hex.
+                    if req_type == 'tank' and self.is_artefact_cell[eid]:
+                        continue
+
+                    if target_owner == -1:
+                        for amount in range(1, src_count + 1):
+                            actions.append(('move', start, end, amount))
+                        continue
+
+                    if target_owner == self.turn:
+                        # Merge only with same type.
+                        if (req_type == 'tank' and target_kind == 2) or (req_type == 'bot' and target_kind == 1):
+                            for amount in range(1, src_count + 1):
+                                actions.append(('move', start, end, amount))
+                        continue
+
+                    # Enemy target.
+                    if req_type == 'bot':
+                        continue
+                    # Tank vs enemy bot: any amount legal.
+                    if target_kind == 1:
+                        for amount in range(1, src_count + 1):
+                            actions.append(('move', start, end, amount))
+                        continue
+                    # Tank vs enemy tank: must be strictly larger.
+                    if target_kind == 2 and src_count > target_count:
+                        for amount in range(target_count + 1, src_count + 1):
+                            actions.append(('move', start, end, amount))
             return actions
 
         return actions
