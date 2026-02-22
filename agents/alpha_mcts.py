@@ -53,6 +53,11 @@ class AlphaMCTS:
         c_puct: float = 1.5,
         dirichlet_alpha: float = 0.3,
         dirichlet_eps: float = 0.25,
+        heuristic_value_weight: float = 0.0,
+        heuristic_action_weight: float = 0.0,
+        heuristic_score_weight: float = 1.0,
+        heuristic_tank_weight: float = 0.18,
+        heuristic_bot_weight: float = 0.12,
         device: str = "cpu",
         seed: int | None = None,
     ):
@@ -63,6 +68,11 @@ class AlphaMCTS:
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
+        self.heuristic_value_weight = max(0.0, min(1.0, float(heuristic_value_weight)))
+        self.heuristic_action_weight = max(0.0, float(heuristic_action_weight))
+        self.heuristic_score_weight = float(heuristic_score_weight)
+        self.heuristic_tank_weight = float(heuristic_tank_weight)
+        self.heuristic_bot_weight = float(heuristic_bot_weight)
         self.device = torch.device(device)
         self.rng = random.Random(seed)
 
@@ -80,6 +90,13 @@ class AlphaMCTS:
             return 0.0
 
         logits, value = self._policy_value(game)
+        if self.heuristic_action_weight > 0.0:
+            bonuses = np.array(
+                [self._heuristic_action_bonus(game, self.action_space.from_index(a)) for a in legal],
+                dtype=np.float32,
+            )
+            logits = logits.copy()
+            logits[legal] = logits[legal] + self.heuristic_action_weight * bonuses
         legal_logits = logits[legal]
         legal_logits = legal_logits - np.max(legal_logits)
         probs = np.exp(legal_logits)
@@ -97,16 +114,62 @@ class AlphaMCTS:
         node.visit_count = {a: 0 for a in legal}
         node.value_sum = {a: 0.0 for a in legal}
         node.expanded = True
+        if self.heuristic_value_weight > 0.0:
+            h = self._heuristic_state_value(game, int(game.turn))
+            value = (1.0 - self.heuristic_value_weight) * value + self.heuristic_value_weight * h
         return value
+
+    def _owner_counts(self, game: SatellitesGame, owner: int) -> tuple[int, int]:
+        game._ensure_cache()
+        tank_count = 0
+        bot_count = 0
+        for cid in game.owner_tank_cells[owner]:
+            tank_count += int(game.unit_count[cid])
+        for cid in game.owner_bot_cells[owner]:
+            bot_count += int(game.unit_count[cid])
+        return tank_count, bot_count
+
+    def _heuristic_state_value(self, game: SatellitesGame, player: int) -> float:
+        enemy = 1 - player
+        score_diff = float(game.scores[player] - game.scores[enemy])
+        my_tanks, my_bots = self._owner_counts(game, player)
+        en_tanks, en_bots = self._owner_counts(game, enemy)
+        tank_diff = float(my_tanks - en_tanks)
+        bot_diff = float(my_bots - en_bots)
+        raw = (
+            self.heuristic_score_weight * score_diff
+            + self.heuristic_tank_weight * tank_diff
+            + self.heuristic_bot_weight * bot_diff
+        )
+        return float(math.tanh(raw / 3.0))
+
+    def _heuristic_action_bonus(self, game: SatellitesGame, action) -> float:
+        kind = action[0]
+        if kind == "move":
+            src, dst, amount = action[1], action[2], int(action[3])
+            u = game.grid.get(src)
+            if not u:
+                return 0.0
+            if u["type"] == "bot":
+                bonus = 0.0
+                if dst in game.artefacts:
+                    bonus += 3.0 + 0.15 * float(amount)
+                old_d = min((game.get_hex_distance(src, a) for a in game.artefacts), default=99)
+                new_d = min((game.get_hex_distance(dst, a) for a in game.artefacts), default=99)
+                bonus += 0.25 * float(old_d - new_d)
+                return bonus
+            if u["type"] == "tank":
+                return 0.05 * float(amount)
+        return 0.0
 
     def _terminal_value_for_current_player(self, game: SatellitesGame) -> float:
         if game.winner is None or game.winner == -1:
             return 0.0
         return 1.0 if game.winner == game.turn else -1.0
 
-    def search(self, root_game: SatellitesGame) -> Tuple[AlphaNode, np.ndarray]:
+    def search(self, root_game: SatellitesGame, *, add_root_noise: bool = True) -> Tuple[AlphaNode, np.ndarray]:
         root = AlphaNode(player_to_move=int(root_game.turn))
-        self._expand(root, root_game, add_noise=True)
+        self._expand(root, root_game, add_noise=add_root_noise)
 
         for _ in range(self.simulations):
             game = root_game.clone()
@@ -144,8 +207,14 @@ class AlphaMCTS:
         pi = self.action_space.visit_policy(root.visit_count, temperature=1.0)
         return root, pi
 
-    def select_action(self, root_game: SatellitesGame, temperature: float = 1.0):
-        root, _ = self.search(root_game)
+    def select_action(
+        self,
+        root_game: SatellitesGame,
+        temperature: float = 1.0,
+        *,
+        add_root_noise: bool = True,
+    ):
+        root, _ = self.search(root_game, add_root_noise=add_root_noise)
         pi = self.action_space.visit_policy(root.visit_count, temperature=temperature)
         if pi.sum() <= 0:
             legal = root_game.legal_actions()

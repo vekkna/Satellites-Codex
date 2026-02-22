@@ -233,14 +233,17 @@ def test_adapter_weight_save_load_roundtrip(tmp_path) -> None:
     assert abs(adapter2.get_weights()["move_bot_capture"] - 9.25) < 1e-9
 
 
-def test_adapter_is_heuristic_neutral() -> None:
+def test_adapter_heuristics_are_active() -> None:
     game = SatellitesGame(headless=True)
     adapter = SatellitesAdapter()
 
-    action = game.legal_actions()[0]
-    assert adapter.evaluate(game, 0) == 0.0
-    assert adapter.action_prior(game, action, 0) == 0.0
-    assert adapter.tactical_priority(game, action, 0) == 0
+    action = ("select_satellite", 0)
+    score = adapter.evaluate(game, 0)
+    prior = adapter.action_prior(game, action, 0)
+    tact = adapter.tactical_priority(game, action, 0)
+    assert -1.0 <= score <= 1.0
+    assert isinstance(prior, float)
+    assert isinstance(tact, int)
 
 
 def test_state_key_changes_with_state_mutation() -> None:

@@ -364,6 +364,8 @@ class SatellitesAdapter:
 
     DEFAULT_WEIGHTS = {
         "score_diff": 100.0,
+        "tank_diff": 18.0,
+        "bot_diff": 12.0,
         "near_win": 60.0,
         "cap_next": 40.0,
         "race_early": 20.0,
@@ -476,14 +478,233 @@ class SatellitesAdapter:
                 return True
         return False
 
+    def _owner_counts(self, state: Any, owner: int) -> Tuple[int, int]:
+        state._ensure_cache()
+        tank_count = 0
+        bot_count = 0
+        for cid in state.owner_tank_cells[owner]:
+            tank_count += int(state.unit_count[cid])
+        for cid in state.owner_bot_cells[owner]:
+            bot_count += int(state.unit_count[cid])
+        return tank_count, bot_count
+
+    def _cap_next_count(self, state: Any, owner: int) -> int:
+        caps = 0
+        for artefact in state.artefacts:
+            for nr, nc in state.get_hex_neighbors(artefact[0], artefact[1]):
+                u = state.grid.get((nr, nc))
+                if u and u["owner"] == owner and u["type"] == "bot" and u["count"] > 0:
+                    caps += 1
+                    break
+        return caps
+
+    def _bot_threat_count(self, state: Any, owner: int) -> int:
+        threatened = 0
+        for pos, cnt in self._unit_cells(state, owner, "bot"):
+            if self._is_adj_enemy_tank(state, owner, pos):
+                threatened += int(cnt)
+        return threatened
+
+    def _safe_near_artefact_bots(self, state: Any, owner: int) -> int:
+        safe = 0
+        for pos, cnt in self._unit_cells(state, owner, "bot"):
+            d = 99
+            for a in state.artefacts:
+                d = min(d, state.get_hex_distance(pos, a))
+            if d <= 1 and not self._is_adj_enemy_tank(state, owner, pos):
+                safe += int(cnt)
+        return safe
+
+    def _tanks_near_artefacts(self, state: Any, owner: int) -> int:
+        near = 0
+        for pos, cnt in self._unit_cells(state, owner, "tank"):
+            for a in state.artefacts:
+                if state.get_hex_distance(pos, a) <= 2:
+                    near += int(cnt)
+                    break
+        return near
+
+    def _race_pressure(self, state: Any, owner: int) -> float:
+        enemy = 1 - owner
+        if not state.artefacts:
+            return 0.0
+        total = 0.0
+        for a in state.artefacts:
+            my_d = self._min_bot_dist(state, owner, a)
+            en_d = self._min_bot_dist(state, enemy, a)
+            total += float(en_d - my_d)
+        return total / float(max(1, len(state.artefacts)))
+
     def evaluate(self, state: Any, player: Player) -> float:
-        # Training baseline: no handcrafted leaf heuristic.
-        return 0.0
+        if self.is_terminal(state):
+            return self.outcome_for_player(state, player)
+
+        enemy = 1 - player
+        w = self.weights
+        my_score = int(state.scores[player])
+        en_score = int(state.scores[enemy])
+        score_diff = float(my_score - en_score)
+        my_tanks, my_bots = self._owner_counts(state, player)
+        en_tanks, en_bots = self._owner_counts(state, enemy)
+        tank_diff = float(my_tanks - en_tanks)
+        bot_diff = float(my_bots - en_bots)
+
+        remaining = len(state.artefacts)
+        progress = 1.0 - (float(remaining) / 6.0)
+        race_w = (
+            w["race_early"] if progress < 0.33 else
+            (w["race_mid"] if progress < 0.66 else w["race_late"])
+        )
+        cap_next_diff = float(self._cap_next_count(state, player) - self._cap_next_count(state, enemy))
+        threat_diff = float(self._bot_threat_count(state, enemy) - self._bot_threat_count(state, player))
+        safe_bot_diff = float(self._safe_near_artefact_bots(state, player) - self._safe_near_artefact_bots(state, enemy))
+        tank_near_diff = float(self._tanks_near_artefacts(state, player) - self._tanks_near_artefacts(state, enemy))
+        near_win = 1.0 if my_score >= 8 else (-1.0 if en_score >= 8 else 0.0)
+        race_term = self._race_pressure(state, player)
+
+        raw = (
+            w["score_diff"] * score_diff
+            + w["tank_diff"] * tank_diff
+            + w["bot_diff"] * bot_diff
+            + w["near_win"] * near_win
+            + w["cap_next"] * cap_next_diff
+            + race_w * race_term
+            + w["bot_tank_threat"] * threat_diff
+            + w["tank_dominance"] * tank_diff
+            + w["tanks_near_artefact"] * tank_near_diff
+            + w["eval_safe_bot_near_artefact"] * safe_bot_diff
+        )
+        # Keep heuristic bounded and stable for UCT rollouts.
+        return float(math.tanh(raw / 250.0))
 
     def action_prior(self, state: Any, action: Action, player: Player) -> float:
-        return 0.0
+        w = self.weights
+        kind = action[0]
+        base = 0.0
+
+        if kind == "select_satellite":
+            sat = state.satellites[action[1]]
+            charges = float(sat.get("charges", 0))
+            if charges <= 0:
+                return -1000.0
+            base += charges * w["sat_charge"]
+            stype = sat.get("type", "")
+            if stype == "move_bot":
+                base += w["sat_move_bot_bonus"]
+            elif stype == "move_tank":
+                base += w["sat_move_tank_bonus"]
+            elif stype == "add_tank":
+                base += w["sat_add_tank_bonus"]
+            elif stype == "add_bot":
+                base += w["sat_add_bot_bonus"]
+            return base
+
+        if kind == "set_direction":
+            # Slight preference for preserving stronger satellites via reverse spread.
+            return 0.1 if action[1] else 0.0
+
+        if kind == "add":
+            pos = (action[1], action[2])
+            if state.action_type == "add_tank":
+                d = min((state.get_hex_distance(pos, a) for a in state.artefacts), default=99)
+                base += w["add_tank_near_artefact"] * max(0.0, 4.0 - float(d))
+                for nr, nc in state.get_hex_neighbors(pos[0], pos[1]):
+                    u = state.grid.get((nr, nc))
+                    if u and u["owner"] == (1 - player) and u["type"] == "bot":
+                        base += w["add_tank_near_enemy_bot"] * float(u["count"])
+                return base
+
+            if state.action_type == "add_bot":
+                d = min((state.get_hex_distance(pos, a) for a in state.artefacts), default=99)
+                base += w["add_bot_dist_gain"] * max(0.0, 6.0 - float(d))
+                if self._is_adj_enemy_tank(state, player, pos):
+                    base -= w["add_bot_tank_threat_penalty"]
+                if d <= 1 and not self._is_adj_enemy_tank(state, player, pos):
+                    base += w["add_bot_stack_near_artefact"]
+                return base
+            return base
+
+        if kind == "move":
+            src = action[1]
+            dst = action[2]
+            amount = int(action[3])
+            src_u = state.grid.get(src)
+            if not src_u or src_u["owner"] != player:
+                return -1000.0
+
+            if src_u["type"] == "bot":
+                if dst in state.artefacts:
+                    base += w["move_bot_capture"] + w["move_bot_capture_stack_scale"] * float(amount)
+                old_d = min((state.get_hex_distance(src, a) for a in state.artefacts), default=99)
+                new_d = min((state.get_hex_distance(dst, a) for a in state.artefacts), default=99)
+                base += w["move_bot_dist_delta"] * float(old_d - new_d)
+                threatened = self._is_adj_enemy_tank(state, player, dst)
+                if threatened:
+                    base -= w["move_bot_tank_threat_penalty"] * float(amount)
+                elif new_d < old_d:
+                    base += w["move_bot_safe_approach"] * float(amount)
+                return base
+
+            if src_u["type"] == "tank":
+                for nr, nc in state.get_hex_neighbors(dst[0], dst[1]):
+                    u = state.grid.get((nr, nc))
+                    if u and u["owner"] == (1 - player) and u["type"] == "bot":
+                        base += w["move_tank_adj_enemy_bot"] * float(u["count"])
+                u_dst = state.grid.get(dst)
+                if u_dst and u_dst["owner"] == (1 - player) and u_dst["type"] == "tank":
+                    if amount >= int(u_dst["count"]):
+                        base += w["move_tank_vs_tank_win"] * float(amount)
+                    else:
+                        base -= w["move_tank_vs_tank_lose"] * float(int(u_dst["count"]) - amount)
+                d = min((state.get_hex_distance(dst, a) for a in state.artefacts), default=99)
+                base += w["move_tank_near_artefact"] * max(0.0, 4.0 - float(d))
+                return base
+        return base
 
     def tactical_priority(self, state: Any, action: Action, player: Player) -> int:
+        kind = action[0]
+        if kind == "move":
+            src = action[1]
+            dst = action[2]
+            amount = int(action[3])
+            src_u = state.grid.get(src)
+            if not src_u or src_u["owner"] != player:
+                return 0
+            if src_u["type"] == "bot":
+                if dst in state.artefacts:
+                    return min(100, 90 + min(10, amount))
+                if self._is_adj_enemy_tank(state, player, dst):
+                    return 30
+                old_d = min((state.get_hex_distance(src, a) for a in state.artefacts), default=99)
+                new_d = min((state.get_hex_distance(dst, a) for a in state.artefacts), default=99)
+                if new_d < old_d:
+                    return 65
+                return 40
+            if src_u["type"] == "tank":
+                u_dst = state.grid.get(dst)
+                if u_dst and u_dst["owner"] == (1 - player) and u_dst["type"] == "tank":
+                    return 80 if amount >= int(u_dst["count"]) else 45
+                for nr, nc in state.get_hex_neighbors(dst[0], dst[1]):
+                    u = state.grid.get((nr, nc))
+                    if u and u["owner"] == (1 - player) and u["type"] == "bot":
+                        return 75
+                return 50
+        if kind == "add":
+            if state.action_type == "add_bot":
+                pos = (action[1], action[2])
+                d = min((state.get_hex_distance(pos, a) for a in state.artefacts), default=99)
+                return 70 if d <= 1 else 55
+            if state.action_type == "add_tank":
+                return 60
+        if kind == "select_satellite":
+            sat = state.satellites[action[1]]
+            if sat.get("charges", 0) <= 0:
+                return 0
+            if sat.get("type", "") == "move_bot":
+                return 62
+            if sat.get("type", "") == "move_tank":
+                return 58
+            return 45
         return 0
 
     def state_key(self, state: Any) -> Any:
