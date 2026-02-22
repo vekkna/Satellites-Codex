@@ -11,6 +11,13 @@ env/
 # Test/cache tooling
 .pytest_cache/
 
+# Training artifacts
+checkpoints/
+checkpoints_*/
+*.pt
+*.pth
+*.ckpt
+
 # OS/editor noise
 .DS_Store
 Thumbs.db
