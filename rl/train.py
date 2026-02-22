@@ -202,16 +202,22 @@ class Trainer:
             challenger_is_p0 = (game_idx % 2 == 0)
             step = 0
             while game.state != "GAME_OVER" and step < self.config.max_steps_per_game:
+                legal = game.legal_actions()
+                if not legal:
+                    break
                 if game.turn == 0:
                     agent = challenger_mcts if challenger_is_p0 else incumbent_mcts
                 else:
                     agent = incumbent_mcts if challenger_is_p0 else challenger_mcts
-                action, _ = agent.select_action(game, temperature=0.0, add_root_noise=False)
+                try:
+                    action, _ = agent.select_action(game, temperature=0.0, add_root_noise=False)
+                except ValueError as exc:
+                    if "No legal actions from root state." in str(exc):
+                        action = legal[0]
+                    else:
+                        raise
                 ok = game.apply_action(action)
                 if not ok:
-                    legal = game.legal_actions()
-                    if not legal:
-                        break
                     game.apply_action(legal[0])
                 step += 1
 

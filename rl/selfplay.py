@@ -62,9 +62,17 @@ def run_selfplay_game(
     step = 0
 
     while game.state != "GAME_OVER" and step < max_steps:
+        legal_now = game.legal_actions()
+        if not legal_now:
+            break
         temp = 1.0 if step < temperature_turn_cutoff else 0.2
         obs = encoder.encode(game)
-        action, info = mcts.select_action(game, temperature=temp)
+        try:
+            action, info = mcts.select_action(game, temperature=temp)
+        except ValueError as exc:
+            if "No legal actions from root state." in str(exc):
+                break
+            raise
         pi = info["policy"].astype(np.float32)
         history.append((obs, pi, int(game.turn)))
         ok = game.apply_action(action)

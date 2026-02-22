@@ -100,3 +100,18 @@ def test_adjudicate_winner_prefers_score_then_tanks_then_bots() -> None:
     game.add_unit(0, 4, 0, "bot", 3)
     game.add_unit(8, 3, 1, "bot", 1)
     assert adjudicate_winner(game) == 0
+
+
+def test_selfplay_handles_no_legal_action_root_error(monkeypatch) -> None:
+    game = SatellitesGame(headless=True)
+    action_space = GlobalActionSpace(game)
+    enc = FeatureEncoder(game)
+    model = SatellitesPolicyValueNet(enc.feature_dim, action_space.size)
+    mcts = AlphaMCTS(model, action_space, enc, simulations=4, seed=1)
+
+    def _boom(*args, **kwargs):
+        raise ValueError("No legal actions from root state.")
+
+    monkeypatch.setattr(mcts, "select_action", _boom)
+    examples = run_selfplay_game(mcts, enc, max_steps=8)
+    assert examples == []
